@@ -530,11 +530,22 @@ MORI_CMP_LT = 4
 MORI_CMP_GE = 5
 MORI_CMP_SENTINEL = sys.maxsize
 
-# ROCSHMEM_SIGNAL_OPS (enum)
+# ROCSHMEM_SIGNAL_OPS (enum) - rocSHMEM signal operation codes.  These are
+# the values rocSHMEM's ``rocshmem_putmem_signal_nbi`` switch expects; if an
+# unknown sig_op is passed the rocSHMEM device code prints
+# ``Invalid sig_op value (..)`` to the DPRINTF stream and silently DROPS
+# the signal write, leaving any matching wait deadlocked.  This is also why
+# we cannot reuse the NVSHMEM numeric values (NVSHMEM_SIGNAL_SET == 9).
 ROCSHMEM_SIGNAL_SET = 0
 ROCSHMEM_SIGNAL_ADD = 1
 
 # MoRI SHMEM atomicType (enum) - Not all types are currently supported.
+# AMD MoE kernels under ``kernels/amd/`` reference these symbols generically
+# (e.g. ``libshmem_device.MORI_SIGNAL_SET``) because they were ported
+# wholesale from the NVSHMEM kernels where the signal op id was hard-coded
+# to 9.  We therefore make the ``MORI_*`` constants *backend-aware* so the
+# AMD kernels resolve to the correct numeric value depending on whether
+# ``TRITON_DIST_SHMEM_BACKEND`` selected ``rocshmem`` or ``mori_shmem``.
 MORI_AMO_ACK = 1
 MORI_AMO_INC = 2
 MORI_AMO_SET = 3
@@ -543,8 +554,13 @@ MORI_AMO_AND = 5
 MORI_AMO_OR = 6
 MORI_AMO_XOR = 7
 MORI_AMO_SIGNAL = 8
-MORI_SIGNAL_SET = 9
-MORI_SIGNAL_ADD = 10
+if is_rocshmem():
+    # rocSHMEM uses {SET=0, ADD=1}; NVSHMEM/mori use {SIGNAL_SET=9, SIGNAL_ADD=10}.
+    MORI_SIGNAL_SET = ROCSHMEM_SIGNAL_SET
+    MORI_SIGNAL_ADD = ROCSHMEM_SIGNAL_ADD
+else:
+    MORI_SIGNAL_SET = 9
+    MORI_SIGNAL_ADD = 10
 MORI_AMO_SIGNAL_SET = MORI_SIGNAL_SET
 MORI_AMO_SIGNAL_ADD = MORI_SIGNAL_ADD
 MORI_AMO_END_OF_NONFETCH = 13

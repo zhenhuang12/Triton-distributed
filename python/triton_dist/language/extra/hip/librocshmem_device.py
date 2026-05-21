@@ -431,13 +431,105 @@ def barrier_all_wg(_semantic=None):
 
 @core.extern
 def fence(_semantic=None):
+    # NVSHMEM exposes a single ``nvshmem_fence`` that orders all preceding
+    # remote-memory ops; rocSHMEM's device library only ships the
+    # ``rocshmem_fence_wave_wrapper`` variant in the prebuilt bitcode (see
+    # ``shmem/rocshmem_bind/runtime/rocshmem_wrapper.cc``).  Internally that
+    # wrapper just calls ``rocshmem::rocshmem_fence()`` with no scope
+    # argument, so it is functionally equivalent to the missing
+    # ``rocshmem_fence_wrapper`` and we route the public ``fence()`` extern
+    # to it.  This avoids ``HSA_STATUS_ERROR_VARIABLE_UNDEFINED`` at module
+    # load time (manifested as ``hipErrorNoBinaryForGpu`` / HIP code 209).
     return extern_call(
         "librocshmem_device",
         "",
         [],
         {
-            (): ("rocshmem_fence_wrapper", ()),
+            (): ("rocshmem_fence_wave_wrapper", ()),
         },
         is_pure=False,
         _semantic=_semantic,
     )
+
+
+# -- NVIDIA-style "_block" aliases ----------------------------------------
+#
+# The Triton kernels in this project are written against the NVSHMEM naming
+# convention which uses the suffix ``_block`` for whole-CTA collectives
+# (``putmem_signal_nbi_block``, ``barrier_all_block`` ...). rocSHMEM uses
+# ROCm terminology and exposes the same collectives under ``_wg`` (work
+# group); the underlying primitive is identical.  We add ``_block`` aliases
+# here so the cross-backend ``libshmem_device`` dispatcher resolves cleanly
+# on the rocshmem backend.
+@core.extern
+def putmem_block(dest, source, nbytes, pe, _semantic=None):
+    return putmem_wg(dest, source, nbytes, pe, _semantic=_semantic)
+
+
+@core.extern
+def putmem_nbi_block(dest, source, nbytes, pe, _semantic=None):
+    return putmem_nbi_wg(dest, source, nbytes, pe, _semantic=_semantic)
+
+
+@core.extern
+def getmem_block(dest, source, nbytes, pe, _semantic=None):
+    return getmem_wg(dest, source, nbytes, pe, _semantic=_semantic)
+
+
+@core.extern
+def getmem_nbi_block(dest, source, nbytes, pe, _semantic=None):
+    return getmem_nbi_wg(dest, source, nbytes, pe, _semantic=_semantic)
+
+
+@core.extern
+def putmem_signal_block(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=None):
+    return putmem_signal_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=_semantic)
+
+
+@core.extern
+def putmem_signal_nbi_block(dest, source, nbytes, sig_addr, signal, sig_op, pe, qp_id=0, _semantic=None):
+    # qp_id is a mori_shmem-only knob; rocshmem doesn't expose multiple QPs,
+    # so we accept and ignore it for API compatibility.
+    return putmem_signal_nbi_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=_semantic)
+
+
+@core.extern
+def barrier_all_block(_semantic=None):
+    return barrier_all_wg(_semantic=_semantic)
+
+
+@core.extern
+def barrier_all_warp(_semantic=None):
+    # AMD has no separate warp/wave abstraction at this layer; ``_wave`` already
+    # operates on a single wavefront which is the AMD analogue of a CUDA warp.
+    return barrier_all_wave(_semantic=_semantic)
+
+
+@core.extern
+def putmem_warp(dest, source, nbytes, pe, _semantic=None):
+    return putmem_wave(dest, source, nbytes, pe, _semantic=_semantic)
+
+
+@core.extern
+def putmem_nbi_warp(dest, source, nbytes, pe, _semantic=None):
+    return putmem_nbi_wave(dest, source, nbytes, pe, _semantic=_semantic)
+
+
+@core.extern
+def getmem_warp(dest, source, nbytes, pe, _semantic=None):
+    return getmem_wave(dest, source, nbytes, pe, _semantic=_semantic)
+
+
+@core.extern
+def getmem_nbi_warp(dest, source, nbytes, pe, _semantic=None):
+    return getmem_nbi_wave(dest, source, nbytes, pe, _semantic=_semantic)
+
+
+@core.extern
+def putmem_signal_warp(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=None):
+    return putmem_signal_wave(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=_semantic)
+
+
+@core.extern
+def putmem_signal_nbi_warp(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=None):
+    return putmem_signal_nbi_wave(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=_semantic)

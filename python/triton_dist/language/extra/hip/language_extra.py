@@ -236,6 +236,11 @@ def ld(
     _sem = core._unwrap_if_constexpr(semantic)
     _scp = core._unwrap_if_constexpr(scope)
 
+    # Note: ``uint16/int16`` and ``int8/uint8`` overloads are needed by the
+    # 16-bit / 8-bit tail of ``copy_warp`` in ``memory_ops.py``.  The AMD
+    # ``libdevice_extra.ll`` provides the matching ``__triton_hip_load_*``
+    # symbols so we expose the same overload table as on the NVIDIA side
+    # rather than restricting to 32/64-bit and floating point types.
     return dist_core.extern_elementwise(
         "",
         "",
@@ -245,6 +250,10 @@ def ld(
              dtype,
          )
          for dtype in [
+             core.dtype("int8"),
+             core.dtype("uint8"),
+             core.dtype("int16"),
+             core.dtype("uint16"),
              core.dtype("int32"),
              core.dtype("uint32"),
              core.dtype("int64"),
@@ -294,6 +303,10 @@ def st(
              dtype,
          )
          for dtype in [
+             core.dtype("int8"),
+             core.dtype("uint8"),
+             core.dtype("int16"),
+             core.dtype("uint16"),
              core.dtype("int32"),
              core.dtype("uint32"),
              core.dtype("int64"),

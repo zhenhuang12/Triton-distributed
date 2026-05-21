@@ -8,9 +8,9 @@ ROCSHMEM_ROOT=${SCRIPT_DIR}/../shmem/rocshmem_bind/rocshmem_build/install
 MPI_ROOT="${OMPI_INSTALL_DIR:-/opt/ompi_build}/install/ompi"
 
 # Only add rocshmem and MPI to LD_LIBRARY_PATH if not using mori_shmem backend
-if [ "${TRITON_DIST_SHMEM_BACKEND}" != "mori_shmem" ]; then
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${ROCSHMEM_ROOT}/lib:${MPI_ROOT}/lib
-fi
+# if [ "${TRITON_DIST_SHMEM_BACKEND}" != "mori_shmem" ]; then
+#   export LD_LIBRARY_PATH=${MPI_ROOT}/lib:${ROCSHMEM_ROOT}/lib:$LD_LIBRARY_PATH
+# fi
 
 case ":${PYTHONPATH}:" in
     *:"${DISTRIBUTED_DIR}/python:${PYROCSHMEM_DIR}/build:${TRITON_ROCSHMEM_DIR}":*)
@@ -24,6 +24,15 @@ export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-triton_cache}
 export ROCSHMEM_HOME=${ROCSHMEM_ROOT}
 export ROCSHMEM_BACKEND=${ROCSHMEM_BACKEND:=IPC}
 export ROCSHMEM_GDA_PROVIDER=${ROCSHMEM_GDA_PROVIDER:=mlx5} # Only used with backend GDA
+
+# rocSHMEM allocates its symmetric heap at ``rocshmem_init``; resizing the env
+# var later (as the EP MoE ``init_triton_dist_ep_op`` helper does on first run)
+# has no effect on the already-committed heap.  Provide a default that is
+# generous enough for the AMD EP MoE unit tests (~512 MB/PE) so initial
+# allocations succeed without needing a second process launch.
+export ROCSHMEM_HEAP_SIZE=${ROCSHMEM_HEAP_SIZE:-536870912}
+
+export HSA_ENABLE_IPC_MODE_LEGACY=1
 
 ## AMD env vars
 export TRITON_HIP_USE_BLOCK_PINGPONG=1 # for gemm perf

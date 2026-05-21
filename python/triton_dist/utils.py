@@ -184,10 +184,24 @@ def init_seed(seed=0):
     random.seed(3 + seed)
 
 
+def _maybe_set_local_world_size_from_env():
+    global _TRITON_DIST_LOCAL_WORLD_SIZE
+    if _TRITON_DIST_LOCAL_WORLD_SIZE is not None:
+        return
+    lws = os.environ.get("LOCAL_WORLD_SIZE")
+    if lws is not None:
+        _TRITON_DIST_LOCAL_WORLD_SIZE = int(lws)
+        return
+    ws = os.environ.get("WORLD_SIZE")
+    if ws is not None:
+        _TRITON_DIST_LOCAL_WORLD_SIZE = int(ws)
+
+
 def init_rocshmem_by_torch_process_group(pg: torch.distributed.ProcessGroup):
     global _TRITON_DIST_WORLD
     assert _TRITON_DIST_WORLD is None, "TRITON_DIST_WORLD has already been initialized"
     _TRITON_DIST_WORLD = pg
+    _maybe_set_local_world_size_from_env()
 
     pyrocshmem.init_rocshmem_by_uniqueid(pg)
 
@@ -197,6 +211,7 @@ def init_mori_by_torch_process_group(pg: torch.distributed.ProcessGroup):
     global _TRITON_DIST_WORLD
     assert _TRITON_DIST_WORLD is None, "TRITON_DIST_WORLD has already been initialized"
     _TRITON_DIST_WORLD = pg
+    _maybe_set_local_world_size_from_env()
 
     rank, nranks = pg.rank(), pg.size()
     if rank == 0:
@@ -225,6 +240,7 @@ def init_nvshmem_by_torch_process_group(pg: torch.distributed.ProcessGroup):
     assert _TRITON_DIST_WORLD is None, "TRITON_DIST_WORLD has already been initialized"
 
     _TRITON_DIST_WORLD = pg
+    _maybe_set_local_world_size_from_env()
     torch.cuda.synchronize()
     # Extract rank, nranks from process group
     num_ranks = pg.size()
@@ -291,6 +307,62 @@ def mori_shmem_free_tensor_sync(tensor):
     # torch.cuda.synchronize()
     mori_shmem.mori_shmem_free_tensor(tensor)
     # torch.cuda.synchronize()
+
+
+def rocshmem_create_tensor(shape, dtype) -> torch.Tensor:
+    """Allocate a symmetric tensor from the rocshmem heap.
+
+    Mirrors :func:`nvshmem_create_tensor` / :func:`mori_shmem_create_tensor`
+    so backend-aware higher-level helpers can dispatch on
+    :func:`get_shmem_backend`. rocshmem requires a synchronize before the
+    collective heap allocation to make sure prior work is drained.
+    """
+    torch.cuda.synchronize()
+    tensor = pyrocshmem.rocshmem_create_tensor(shape, dtype=dtype)
+    torch.cuda.synchronize()
+    return tensor
+
+
+def rocshmem_free_tensor_sync(tensor):
+    """rocshmem symmetric tensors are freed when the Python ``SymmRocShmemBuffer``
+    is garbage-collected. We synchronize so pending GPU work is drained
+    *before* the caller drops its last reference, matching the semantics of
+    :func:`nvshmem_free_tensor_sync`.
+    """
+    torch.cuda.synchronize()
+
+
+def shmem_create_tensor(shape, dtype) -> torch.Tensor:
+    """Backend-aware symmetric-tensor allocator.
+
+    Dispatches to nvshmem on CUDA, and to either rocshmem or mori_shmem on
+    HIP based on :func:`get_shmem_backend`. Callers that need to be portable
+    across all backends should prefer this over the backend-specific helpers.
+    """
+    if is_cuda():
+        return nvshmem_create_tensor(shape, dtype)
+    if is_hip():
+        backend = get_shmem_backend()
+        if backend == 'mori_shmem':
+            return mori_shmem_create_tensor(shape, dtype)
+        if backend == 'rocshmem':
+            return rocshmem_create_tensor(shape, dtype)
+        raise RuntimeError(f"Unsupported SHMEM backend on HIP: {backend!r}")
+    raise RuntimeError("Unsupported platform: neither CUDA nor HIP")
+
+
+def shmem_free_tensor_sync(tensor):
+    """Backend-aware counterpart of :func:`shmem_create_tensor`."""
+    if is_cuda():
+        return nvshmem_free_tensor_sync(tensor)
+    if is_hip():
+        backend = get_shmem_backend()
+        if backend == 'mori_shmem':
+            return mori_shmem_free_tensor_sync(tensor)
+        if backend == 'rocshmem':
+            return rocshmem_free_tensor_sync(tensor)
+        raise RuntimeError(f"Unsupported SHMEM backend on HIP: {backend!r}")
+    raise RuntimeError("Unsupported platform: neither CUDA nor HIP")
 
 
 def finalize_distributed():
@@ -536,6 +608,23 @@ def supports_p2p_native_atomic():
     count = torch.cuda.device_count()
     if count <= 1:
         return True
+
+    if is_hip():
+        # ROCm exposes ``hipDeviceGetP2PAttribute`` (``hipDevP2PAttrHipArrayAccessSupported``,
+        # ``hipDevP2PAttrNativeAtomicSupported``) via the HIP runtime.  Use the
+        # python ``hip`` bindings to mirror the CUDA path.  On all MI300/MI355 SKUs
+        # we tested the answer is "yes" -- the IPC backend in ``rocshmem`` and
+        # the intra-node CAS-style barriers in ``common_ops.py`` both rely on
+        # native HBM atomics over XGMI.
+        from hip import hip as _hip
+        err, support = _hip.hipDeviceGetP2PAttribute(
+            _hip.hipDeviceP2PAttr.hipDevP2PAttrNativeAtomicSupported, 0, 1)
+        if err != _hip.hipError_t.hipSuccess:
+            warnings.warn(
+                f"hipDeviceGetP2PAttribute failed ({err}); assuming native atomics are supported on ROCm"
+            )
+            return True
+        return support == 1
 
     # force create CUDA context
     (err, ) = cudart.cudaFree(0)
@@ -1534,4 +1623,46 @@ class NVSHMEMLazyAllocator(LazyAllocator):
 
     def get_total_nvshmem_size_mb(self) -> float:
         """Get the total nvshmem size in MB."""
+        return self.get_total_size_mb()
+
+
+def shmem_free_lazy_tensor(tensor_or_lazy):
+    """Backend-aware analog of :func:`nvshmem_free_lazy_tensor`."""
+    underlying = get_underlying_tensor(tensor_or_lazy)
+    if underlying is not None:
+        shmem_free_tensor_sync(underlying)
+
+
+class ShmemLazyAllocator(LazyAllocator):
+    """
+    Backend-aware lazy allocator for symmetric tensors.
+
+    Picks the right symmetric-tensor allocator based on
+    :func:`get_shmem_backend`:
+
+    - CUDA + nvshmem: ``nvshmem_create_tensor`` / ``nvshmem_free_tensor_sync``
+    - HIP + mori_shmem: ``mori_shmem_create_tensor`` / ``mori_shmem_free_tensor_sync``
+    - HIP + rocshmem: ``rocshmem_create_tensor`` / ``rocshmem_free_tensor_sync``
+
+    Code that used :class:`NVSHMEMLazyAllocator` on CUDA can switch to
+    :class:`ShmemLazyAllocator` to gain portable AMD support without any
+    other change.
+    """
+
+    def __init__(self, lazy: bool = False):
+        super().__init__(
+            create_tensor_fn=shmem_create_tensor,
+            free_tensor_fn=shmem_free_tensor_sync,
+            lazy=lazy,
+        )
+
+    # Same convenience aliases as NVSHMEMLazyAllocator so call sites need
+    # not branch on the backend.
+    def get_total_nvshmem_size(self) -> int:
+        return self.get_total_size()
+
+    def get_total_nvshmem_size_gb(self) -> float:
+        return self.get_total_size_gb()
+
+    def get_total_nvshmem_size_mb(self) -> float:
         return self.get_total_size_mb()

@@ -29,14 +29,35 @@ import triton_dist
 import triton_dist.language as dl
 from typing import Optional
 
-from triton_dist.language.extra.hip.language_extra import load, atomic_add, sync_grid, atomic_cas, tid, __syncthreads
+from triton_dist.language.extra.hip.language_extra import (
+    load,
+    atomic_add,
+    sync_grid,
+    atomic_cas,
+    tid,
+    __syncthreads,
+    ld,
+    st,
+)
 from hip import hip
 from triton_dist.utils import (
     HIP_CHECK,
     get_shmem_backend,
     mori_shmem_barrier_all_on_stream,
     rocshmem_barrier_all_on_stream,
+    MORI_SHMEM_SIGNAL_DTYPE,
+    mori_shmem_create_tensor,
+    mori_shmem_free_tensor_sync,
+    supports_p2p_native_atomic,
+    get_triton_dist_world,
+    get_triton_dist_local_world_size,
 )
+
+# AMD MoE/Fused EP code is structurally derived from NVIDIA. Keep the
+# NVSHMEM_SIGNAL_DTYPE name as an alias to MORI_SHMEM_SIGNAL_DTYPE so that
+# downstream layer code that imports NVSHMEM_SIGNAL_DTYPE keeps working without
+# rename and the diff against the NVIDIA file stays minimal.
+NVSHMEM_SIGNAL_DTYPE = MORI_SHMEM_SIGNAL_DTYPE
 
 
 @triton.jit
@@ -179,11 +200,125 @@ def barrier_all_kernel(rank, num_ranks, comm_buf_ptr):
     __syncthreads()
 
 
-def barrier_all_on_stream(stream: Optional[torch.cuda.Stream] = None):
-    """Call shmem barrier on stream: mori_shmem when backend is mori_shmem, else rocshmem."""
+def nvshmem_barrier_all_on_stream(stream: Optional[torch.cuda.Stream] = None):
+    """Call shmem barrier on stream: mori_shmem when backend is mori_shmem, else rocshmem.
+
+    Named ``nvshmem_*`` to mirror NVIDIA helpers so that copied EP MoE / Fused
+    layer code on AMD can import this symbol with no rename.
+    """
     if get_shmem_backend() == "mori_shmem":
         return mori_shmem_barrier_all_on_stream(stream)
     return rocshmem_barrier_all_on_stream(stream)
+
+
+@triton_dist.jit(do_not_specialize=["local_rank", "rank", "local_world_size"])
+def barrier_all_intra_node_atomic_cas_block(local_rank, rank, local_world_size, symm_flag_ptr):
+    """Intra-node barrier across `local_world_size` ranks using atomic CAS over
+    symmetric memory.
+
+    NOTE: requires a P2P fabric that supports native atomics. On AMD this
+    requires MI300X / MI355X with XGMI. Caller should gate on
+    :func:`supports_p2p_native_atomic`.
+    """
+    with dl.simt_exec_region() as (thread_idx, block_size):
+        local_rank_offset = rank - local_rank
+        if thread_idx < local_world_size:  # thread_idx => local_rank
+            remote_ptr = dl.symm_at(symm_flag_ptr + local_rank, thread_idx + local_rank_offset)
+            while atomic_cas(remote_ptr, 0, 1, scope="system", semantic="release") != 0:
+                pass
+
+        if thread_idx < local_world_size:  # thread_idx => local_rank
+            while (atomic_cas(symm_flag_ptr + thread_idx, 1, 0, scope="system", semantic="acquire") != 1):
+                pass
+        __syncthreads()
+
+
+@triton_dist.jit
+def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_size, symm_flags, target_value):
+    with dl.simt_exec_region() as (thread_idx, block_size):
+        if thread_idx < local_world_size:  # thread_idx => local_rank
+            local_rank_offset = rank - local_rank
+            remote_ptr = dl.symm_at(symm_flags + local_rank, thread_idx + local_rank_offset)
+            st(remote_ptr, target_value, scope="system", semantic="release")
+            while ld(symm_flags + thread_idx, scope="system", semantic="acquire") != target_value:
+                pass
+        __syncthreads()
+
+
+@triton_dist.jit(do_not_specialize=["local_rank", "rank", "num_ranks", "target_value"])
+def barrier_all_intra_node_non_atomic_block(local_rank, rank, num_ranks, symm_flags, target_value):
+    """
+        symm_flags is expected to:
+        1. of int32 or int64 dtype
+        2. has at least num_ranks * 2 elements
+        3. of symmetric pointer
+
+        symm_flags [0, num_ranks * 2) is used to sync all ranks.
+    """
+    tl.static_assert(symm_flags.dtype.element_ty == tl.int32 or symm_flags.dtype.element_ty == tl.int64)
+    _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flags, target_value)
+    # next iter
+    _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flags + num_ranks, target_value)
+
+
+class BarrierAllContext:
+    """
+    You may use this to barrier all ranks in global, or just in intra-node team.
+
+    NOTE: shmem barrier_all is slower for intra-node only.
+    """
+
+    def __init__(self, is_intra_node):
+        import os as _os
+        from triton_dist.utils import shmem_create_tensor, shmem_free_tensor_sync
+        self.is_intra_node = is_intra_node
+        self.target_value = 1
+        self._shmem_free_tensor_sync = shmem_free_tensor_sync
+        if self.is_intra_node:
+            # On AMD we don't have nvshmem.team_my_pe(TEAM_NODE); we derive
+            # ``rank`` from the triton_dist world (set up by
+            # init_rocshmem/mori/nvshmem_by_torch_process_group), and
+            # ``local_world_size`` from torch's standard env var. Intra-node
+            # implies world_size == local_world_size for the callers we care
+            # about, but ``local_rank = rank % local_world_size`` keeps us
+            # correct under non-uniform rank ordering.
+            self.rank = get_triton_dist_world().rank()
+            self.local_world_size = (
+                get_triton_dist_local_world_size()
+                or int(_os.environ.get("LOCAL_WORLD_SIZE", "0"))
+                or int(_os.environ.get("WORLD_SIZE", "1"))
+            )
+            self.local_rank = self.rank % self.local_world_size
+            self.num_local_ranks = self.local_world_size
+            self.symm_barrier = shmem_create_tensor((self.num_local_ranks, ), torch.int32)
+            self.symm_barrier.fill_(0)
+            nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
+
+    def finalize(self):
+        if self.is_intra_node:
+            self._shmem_free_tensor_sync(self.symm_barrier)
+
+
+def barrier_all_on_stream(ctx: Optional["BarrierAllContext"] = None, stream: Optional[torch.cuda.Stream] = None):
+    """
+    NVIDIA-style barrier on stream.
+
+    - When ``ctx`` is ``None`` or not intra-node, falls back to the global
+      shmem barrier (``mori_shmem`` or ``rocshmem``).
+    - When ``ctx`` is intra-node, uses a fast intra-node CAS barrier (or
+      non-atomic flag barrier on fabrics without native atomics).
+
+    barrier_all_on_stream does not support CUDAGraph.
+    """
+    if ctx is None or not ctx.is_intra_node:
+        return nvshmem_barrier_all_on_stream(stream)
+
+    if supports_p2p_native_atomic():
+        barrier_all_intra_node_atomic_cas_block[(1, )](ctx.local_rank, ctx.rank, ctx.num_local_ranks, ctx.symm_barrier)
+    else:
+        barrier_all_intra_node_non_atomic_block[(1, )](ctx.local_rank, ctx.rank, ctx.num_local_ranks, ctx.symm_barrier,
+                                                       ctx.target_value)
+        ctx.target_value += 1
 
 
 def _wait_eq_hip(signal_tensor: torch.Tensor, val: int, stream: Optional[torch.cuda.Stream] = None):

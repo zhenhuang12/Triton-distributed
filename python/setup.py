@@ -459,9 +459,17 @@ def build_rocshmem():
     if not os.path.exists(rocshmem_bind_dir):
         raise RuntimeError("ROCSHMEM bind source directory not found")
 
-    ROCM_ARCH = "gfx942"  # hard-code for now
+    # Allow callers to override via env var (e.g. ``ROCM_ARCH=gfx950 pip install``),
+    # falling back to gfx942 to preserve the previous default.
+    ROCM_ARCH = os.getenv("ROCM_ARCH", "gfx942")
     extra_args = ["--arch", ROCM_ARCH] if ROCM_ARCH != "" else []
-    subprocess.check_call(["bash", f"{rocshmem_bind_dir}/build.sh"] + extra_args)
+    env = os.environ.copy()
+    # The device bitcode is also compiled with --offload-arch=$BITCODE_LIB_ARCH;
+    # keep it in sync with ROCM_ARCH so the produced .bc matches the GPU we
+    # build for. This was previously hard-coded to gfx942 in
+    # ``build_rocshmem_device_bc.sh``.
+    env.setdefault("BITCODE_LIB_ARCH", ROCM_ARCH)
+    subprocess.check_call(["bash", f"{rocshmem_bind_dir}/build.sh"] + extra_args, env=env)
 
 
 def build_mxshmem():

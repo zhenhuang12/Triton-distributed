@@ -58,21 +58,23 @@ ROCSHMEM_INSTALL_DIR=${ROCSHMEM_BUILD_DIR}/install
 OMPI_INSTALL_DIR="${OMPI_INSTALL_DIR:-/opt/ompi_build}"
 
 # build ompi, ucx
-if [ ! -e "${OMPI_INSTALL_DIR}" ]; then
-    # prepare for building ompi, ucx
-    BUILD_DIR=${OMPI_INSTALL_DIR} bash ${ROCSHMEM_SRC_DIR}/scripts/install_dependencies.sh
-else
-    echo "ompi exists, skip building ompi and ucx"
-fi
+# if [ ! -e "${OMPI_INSTALL_DIR}" ]; then
+#     # prepare for building ompi, ucx
+#     BUILD_DIR=${OMPI_INSTALL_DIR} bash ${ROCSHMEM_SRC_DIR}/scripts/install_dependencies.sh
+# else
+#     echo "ompi exists, skip building ompi and ucx"
+# fi
 
-if [ ! -e "$OMPI_INSTALL_DIR" ]; then
-  echo "error: build ompi failed"
-  exit -1
-fi
+# if [ ! -e "$OMPI_INSTALL_DIR" ]; then
+#   echo "error: build ompi failed"
+#   exit -1
+# fi
 
-export PATH="${OMPI_INSTALL_DIR}/install/ompi/bin:$PATH"
-export LD_LIBRARY_PATH="${OMPI_INSTALL_DIR}/install/ompi/lib:$LD_LIBRARY_PATH"
+# export PATH="${OMPI_INSTALL_DIR}/install/ompi/bin:$PATH"
+# export LD_LIBRARY_PATH="${OMPI_INSTALL_DIR}/install/ompi/lib:$LD_LIBRARY_PATH"
 
+ export MPI_ROOT=/opt/ompi
+ export UCX_ROOT=/opt/ucx
 
 # build rocSHMEM
 mkdir -p ${ROCSHMEM_BUILD_DIR} && cd ${ROCSHMEM_BUILD_DIR}

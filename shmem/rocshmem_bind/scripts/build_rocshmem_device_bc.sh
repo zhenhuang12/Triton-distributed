@@ -6,11 +6,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export ROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR:-${SCRIPT_DIR}/../rocshmem_build/install}
 export ROCSHMEM_SRC=${ROCSHMEM_SRC:-${SCRIPT_DIR}/../../../3rdparty/rocshmem}
 export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
-export OMPI_DIR="${OMPI_INSTALL_DIR:-/opt/ompi_build}/install/ompi"
+export OMPI_DIR=/opt/ompi
 
 pushd ${ROCSHMEM_INSTALL_DIR}/lib
 
-export BITCODE_LIB_ARCH=gfx942
+export BITCODE_LIB_ARCH=${BITCODE_LIB_ARCH:-${ROCM_ARCH:-gfx942}}
 CLANG="${ROCM_CXX:-${ROCM_PATH}/lib/llvm/bin/clang++}"
 CLANG_FLAGS=(
     -x hip

@@ -22,3 +22,28 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
+"""Public re-exports for triton_dist.function.
+
+Dispatches between the NVIDIA and AMD implementations of the fused EP MoE
+op based on the current backend (``is_cuda()`` vs ``is_hip()``).
+"""
+
+from triton_dist.utils import is_cuda, is_hip
+
+if is_cuda():
+    from .nvidia.ep_moe_fused import TritonDistFusedEpMoeFunction  # noqa: F401
+    from .nvidia.common import (  # noqa: F401
+        init_triton_dist_ep_op,
+        deinit_triton_dist_ep_op,
+        set_triton_dist_moe_profile_enabled,
+        get_triton_dist_ep_stream,
+    )
+elif is_hip():
+    from .amd.ep_moe_fused import TritonDistFusedEpMoeFunction  # noqa: F401
+    from .amd.common import (  # noqa: F401
+        init_triton_dist_ep_op,
+        deinit_triton_dist_ep_op,
+        set_triton_dist_moe_profile_enabled,
+        get_triton_dist_ep_stream,
+    )
+

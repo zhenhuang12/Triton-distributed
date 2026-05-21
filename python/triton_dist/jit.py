@@ -67,6 +67,10 @@ def shmem_kernel_module_init_hook(*args, **kwargs) -> None:
             import pyrocshmem
             res = hip.hipModuleGetGlobal(kernel_module, b"ROCSHMEM_CTX_DEFAULT")
             # dptr, bytes = res[1], res[2]
+            if os.environ.get("TRITON_DIST_DEBUG_ROCSHMEM_CTX", "") in ("1", "true", "True"):
+                _kname = getattr(jit_function, "__name__", "?")
+                print(f"[shmem_init_hook] kernel={_kname} ROCSHMEM_CTX_DEFAULT lookup status={res[0]}",
+                      flush=True)
             if res[0] == hip.hipError_t.hipSuccess:
                 """
                     typedef struct rocshmem_ctx{
