@@ -299,7 +299,8 @@ class BarrierAllContext:
             self._shmem_free_tensor_sync(self.symm_barrier)
 
 
-def barrier_all_on_stream(ctx: Optional["BarrierAllContext"] = None, stream: Optional[torch.cuda.Stream] = None):
+def barrier_all_on_stream(stream: Optional[torch.cuda.Stream] = None, *,
+                          ctx: Optional["BarrierAllContext"] = None):
     """
     NVIDIA-style barrier on stream.
 
@@ -307,6 +308,9 @@ def barrier_all_on_stream(ctx: Optional["BarrierAllContext"] = None, stream: Opt
       shmem barrier (``mori_shmem`` or ``rocshmem``).
     - When ``ctx`` is intra-node, uses a fast intra-node CAS barrier (or
       non-atomic flag barrier on fabrics without native atomics).
+
+    ``ctx`` is keyword-only so the historical positional
+    ``barrier_all_on_stream(stream)`` call sites keep working unchanged.
 
     barrier_all_on_stream does not support CUDAGraph.
     """
