@@ -92,7 +92,7 @@ def tile_kernel_dispatch_token_intra_node(
     weight_elem_size = 4
     bytes_per_token = 2 * hidden_size
 
-    WARP_SIZE = 32
+    WARP_SIZE = 64
     rank = dl.rank()
     world_size = dl.num_ranks()
     thread_idx = tid(0)
@@ -200,7 +200,7 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
     bytes_per_token = 2 * hidden_size
     num_pid -= num_tail_sms
 
-    WARP_SIZE = 32
+    WARP_SIZE = 64
     rank = dl.rank()
     world_size = dl.num_ranks()
     thread_idx = tid(0)
@@ -326,7 +326,7 @@ def tile_kernel_gather_combine_token_intra_node(
         hidden_size % BARRIER_TOKEN_BLOCK_SIZE == 0,
         f"hidden_size={hidden_size} must be divisible by BARRIER_TOKEN_BLOCK_SIZE={BARRIER_TOKEN_BLOCK_SIZE}")
     N_BARRIERS_PER_TOKEN: tl.constexpr = hidden_size // BARRIER_TOKEN_BLOCK_SIZE
-    WARP_SIZE = 32
+    WARP_SIZE = 64
 
     rank = dl.rank()
     world_size = dl.num_ranks()
@@ -422,7 +422,7 @@ def tile_kernel_scatter_token_intra_node(
         hidden_size % BARRIER_TOKEN_BLOCK_SIZE == 0,
         f"hidden_size={hidden_size} must be divisible by BARRIER_TOKEN_BLOCK_SIZE={BARRIER_TOKEN_BLOCK_SIZE}")
     N_BARRIERS_PER_TOKEN: tl.constexpr = hidden_size // BARRIER_TOKEN_BLOCK_SIZE
-    WARP_SIZE = 32
+    WARP_SIZE = 64
 
     rank = dl.rank()
     thread_idx = tid(0)
@@ -497,7 +497,7 @@ def tile_kernel_topk_reduce_token_intra_node(
     profiler: Profiler,
     ENABLE_PROFILING: tl.constexpr,
 ):
-    WARP_SIZE = 32
+    WARP_SIZE = 64
 
     rank = dl.rank()
     thread_idx = tid(0)
