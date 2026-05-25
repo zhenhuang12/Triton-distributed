@@ -60,6 +60,7 @@ from triton_dist.function import (
     TritonDistFusedEpMoeFunction,
     init_triton_dist_ep_op,
     deinit_triton_dist_ep_op,
+    set_triton_dist_moe_profile_enabled,
 )
 from triton_dist.utils import (
     finalize_distributed,
@@ -68,6 +69,83 @@ from triton_dist.utils import (
     init_rocshmem_by_torch_process_group,
 )
 from triton_dist.profiler_utils import benchmark_latency_memory, print_benchmark_comparison
+
+# In-process aggregator for the in-kernel ENABLE_PROFILING records.
+# Populated by ``_install_kernel_profile_aggregator`` (only when --enable-kernel-profiler).
+# Layout: {kernel_label: {task_name: [duration_ns, ...]}}
+_KERNEL_PROFILE_STATS: dict = {}
+
+
+def _install_kernel_profile_aggregator():
+    """Monkey-patch ``export_to_perfetto_trace`` in the AMD layer so every
+    call (one per dispatch / combine invocation) also pulls the profiler
+    buffer back to the host, decodes it via ``parse_to_tracks``, and
+    accumulates per-task durations into ``_KERNEL_PROFILE_STATS``.
+
+    The original perfetto trace is still written (we just wrap the call),
+    so users can also inspect the last iteration in https://ui.perfetto.dev.
+    """
+    import triton_dist.layers.amd.ep_a2a_fused_layer as _layer
+    from triton_dist.tools.profiler import parse_to_tracks
+
+    _original_export = _layer.export_to_perfetto_trace
+
+    def _wrapped_export(profiler_buffer, task_names, file_name, *args, **kwargs):
+        try:
+            tracks = parse_to_tracks(profiler_buffer)
+            kernel_label = os.path.basename(file_name)
+            bucket = _KERNEL_PROFILE_STATS.setdefault(kernel_label, {})
+            for _block_idx, tasks in tracks.items():
+                for t in tasks:
+                    name = task_names[t.task_type]
+                    bucket.setdefault(name, []).append(int(t.duration))
+        except Exception as e:
+            # Don't let analysis errors mask the underlying run.
+            print(f"[kernel-profiler] aggregation failed for {file_name}: {e}")
+        # tg4perfetto is optional; if it's missing we still want the
+        # in-process aggregator to fire on every iteration.
+        try:
+            return _original_export(profiler_buffer, task_names, file_name, *args, **kwargs)
+        except ImportError as e:
+            print(f"[kernel-profiler] perfetto export skipped ({e}); aggregator OK")
+        return None
+
+    _layer.export_to_perfetto_trace = _wrapped_export
+
+
+def _print_kernel_profile_summary(rank: int):
+    """Pretty-print mean / p50 / p99 per (kernel, task) on rank 0."""
+    if rank != 0 or not _KERNEL_PROFILE_STATS:
+        return
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    def _pct(samples, q):
+        if np is not None:
+            return float(np.percentile(samples, q))
+        s = sorted(samples)
+        k = max(0, min(len(s) - 1, int(round((q / 100.0) * (len(s) - 1)))))
+        return float(s[k])
+
+    print("\n================ in-kernel profiler summary (ns / record) ================")
+    print(f"{'kernel':<48} {'task':<32} {'n':>6} {'mean':>10} {'p50':>10} {'p99':>10} {'max':>10} {'share':>7}")
+    for kernel_label in sorted(_KERNEL_PROFILE_STATS):
+        bucket = _KERNEL_PROFILE_STATS[kernel_label]
+        # Per-kernel total = sum of mean(task) * count(task); use sum of all samples
+        # weighted so tasks with more recorded segments aren't unfairly inflated.
+        total = sum(sum(v) for v in bucket.values()) or 1
+        ordered = sorted(bucket.items(), key=lambda kv: sum(kv[1]), reverse=True)
+        for name, samples in ordered:
+            mean = sum(samples) / len(samples)
+            p50 = _pct(samples, 50)
+            p99 = _pct(samples, 99)
+            share = 100.0 * sum(samples) / total
+            print(f"{kernel_label:<48} {name:<32} {len(samples):>6} "
+                  f"{mean:>10.0f} {p50:>10.0f} {p99:>10.0f} {max(samples):>10} {share:>6.1f}%")
+        print("-" * 120)
+    print("==========================================================================\n")
 
 
 def parse_args():
@@ -89,6 +167,12 @@ def parse_args():
     # forward-only path alive while bisecting backward-kernel issues.
     parser.add_argument("--skip_backward", action="store_true",
                         help="Run forward only (for debugging only; the NVIDIA test always runs forward+backward).")
+    parser.add_argument("--enable-kernel-profiler", action="store_true",
+                        help="Enable the in-kernel ENABLE_PROFILING records (perfetto + per-task summary). "
+                             "Perturbs timing; use small --warmup/--iters when set.")
+    parser.add_argument("--max-tokens-per-rank", type=int, default=None,
+                        help="Override the EP-op symm-heap sizing tile (default 8192*4). "
+                             "Lower this when the mori/rocshmem heap can't hold the default.")
     return parser.parse_args()
 
 
@@ -231,7 +315,7 @@ def main():
           f"num_ranks={num_ranks}, DType={DTYPE}, SM Margin={args.sm_margin}\n")
 
     # Initialize triton_dist EP operation
-    max_tokens_per_rank = 8192 * 4
+    max_tokens_per_rank = args.max_tokens_per_rank if args.max_tokens_per_rank is not None else 8192 * 4
     init_triton_dist_ep_op(
         EP_GROUP,
         max_tokens_per_rank,
@@ -246,6 +330,27 @@ def main():
         num_buffers=1,
         capacity=args.capacity,
     )
+
+    # Optionally turn on the in-kernel profiler. Each fwd/bwd dispatch &
+    # combine call will then allocate a ProfilerBuffer, record per-task
+    # start/end timestamps inside the device kernel, write a
+    # ``prof/mega/<label>_rank_<rank>.perfetto-trace`` (last iter wins),
+    # and feed our aggregator for the end-of-run per-task latency table.
+    if args.enable_kernel_profiler:
+        _install_kernel_profile_aggregator()
+        set_triton_dist_moe_profile_enabled(
+            enabled=True,
+            fwd_dispatch=True,
+            fwd_combine=True,
+            bwd_dispatch=not args.skip_backward,
+            bwd_combine=not args.skip_backward,
+        )
+        if rank == 0:
+            print("[kernel-profiler] ENABLE_PROFILING active for "
+                  f"fwd_dispatch=True fwd_combine=True "
+                  f"bwd_dispatch={not args.skip_backward} bwd_combine={not args.skip_backward}\n"
+                  "[kernel-profiler] NOTE: this perturbs timing; the TFLOPS/latency "
+                  "numbers should be ignored.")
 
     # Test configurations
     test_configs = []
@@ -423,6 +528,9 @@ def main():
         print_benchmark_comparison(
             all_implementations, "Expert Parallel MoE", param_names=['Ntokens', 'Hidden', 'FFN'],
             title_params={'SM_margin': args.sm_margin, 'topk': args.topk, 'num_experts': args.num_experts})
+
+    if args.enable_kernel_profiler:
+        _print_kernel_profile_summary(rank)
 
 
 if __name__ == "__main__":

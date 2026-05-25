@@ -72,7 +72,7 @@ Size (MB)  Shape           CP Engine (GB/s) (ms)     Copy Kernel (GB/s) (ms)    
 """
 
 import torch.distributed
-from triton_dist.utils import sleep_async
+from triton_dist.profiler_utils import sleep_async
 import torch
 import torch.profiler
 import argparse
@@ -84,7 +84,7 @@ import triton.language as tl
 from hip import hip
 from triton_dist.utils import HIP_CHECK
 import pyrocshmem
-from triton_dist.utils import group_profile, perf_func
+from triton_dist.profiler_utils import group_profile, perf_func
 
 
 @triton.jit

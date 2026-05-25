@@ -449,7 +449,7 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                     num_build_sms=8,
                     num_copy_sms=max_sms,
                     num_group_gemm_warps=4,
-                    num_dispatch_warps=8,
+                    num_dispatch_warps=16,
                     num_combine_warps=16,
                     num_dispatch_sms=80,
                     num_tail_sms_in_dispatch=32,

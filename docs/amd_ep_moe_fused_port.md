@@ -24,11 +24,56 @@ TRITON_DIST_SHMEM_BACKEND=rocshmem \
     pip3 install -e python --verbose --no-build-isolation --use-pep517
 
 # run the AMD parity of the NVIDIA fused-EP-MoE test (8 ranks, fwd+bwd)
+ulimit -l unlimited   # rocSHMEM pins its symmetric heap; default 8 MiB memlock fails
+ROCSHMEM_HEAP_SIZE=8589934592 \
 TRITON_DIST_SHMEM_BACKEND=rocshmem \
     bash ./scripts/launch_amd.sh \
          ./python/triton_dist/test/amd/test_ep_moe_fused.py \
          --ntokens 2048 --warmup 2 --iters 3
 ```
+
+### Pre-built `/opt/rocshmem` vs. the in-tree build
+
+The `docker.io/tasimage/primus:pr-715-ainic` image ships a pre-built
+`/opt/rocshmem/lib/librocshmem.a` that was compiled with **`USE_GDA`
+only** (RDMA/InfiniBand backend). On a single-node setup without an
+active IB NIC, linking against it manifests at runtime as
+
+```
+Failed to lock memory pool ((nil)): 0x1001
+```
+
+from `rocm_memory_lock_to_fine_grain` in
+`gda/{ionic,mlx5}/backend_gda_*.cpp` — the GDA backend tries to lock a
+NULL doorbell page because there is no IB device. Setting
+`ROCSHMEM_BACKEND=ipc` does **not** help: the prebuilt `.a` was built
+without `USE_GDA && USE_RO && USE_IPC` all on, so `select_backend_type`
+is not even compiled in (verify with
+`nm /opt/rocshmem/lib/librocshmem.a | grep select_backend_type` — empty
+on the prebuilt, present on the in-tree build).
+
+The in-tree `shmem/rocshmem_bind/build_rocshmem.sh` builds rocSHMEM with
+all three backends (`USE_GDA=ON USE_RO=ON USE_IPC=ON`, see
+`scripts/build_rshm_ipc_single.sh`) and installs it at
+`shmem/rocshmem_bind/rocshmem_build/install`. **`pyrocshmem/setup.py`
+reads `ROCSHMEM_HOME`** when picking the link target — if the container
+has `ROCSHMEM_HOME=/opt/rocshmem` exported (the image default does),
+pyrocshmem links the GDA-only static lib and IPC selection is impossible.
+
+Rebuild pyrocshmem with `ROCSHMEM_HOME` pointed at the in-tree install:
+
+```bash
+cd shmem/rocshmem_bind/pyrocshmem
+rm -rf build dist *.egg-info python/*.egg-info
+export ROCSHMEM_HOME=$PWD/../rocshmem_build/install
+export CXX=hipcc TORCH_DONT_CHECK_COMPILER_ABI=1
+pip3 install --no-build-isolation --no-deps -v .
+```
+
+The build.sh top-level wrapper sets `ROCSHMEM_DIR` for the cmake path
+of pyrocshmem but does **not** override the inherited `ROCSHMEM_HOME`,
+so explicit `unset ROCSHMEM_HOME` (or override as above) is required on
+this container.
 
 If the build fails with `fatal error: 'mpi.h' file not found`, the
 script could not locate the OpenMPI install. The resolution order in
@@ -59,7 +104,7 @@ Optional knobs the test honours:
 
 | Flag                  | Default        | Notes                                                 |
 |-----------------------|----------------|------------------------------------------------------|
-| `--ntokens N`         | `4096`         | per-EP-group tokens; 1024/2048 fit in the 512 MiB heap |
+| `--ntokens N`         | `4096`         | per-EP-group tokens; ntokens=2048 already needs ~7.2 GiB symmetric heap (set `ROCSHMEM_HEAP_SIZE=8589934592`) |
 | `--hidden_dim D`      | `1536`         | matches the NVIDIA reference                         |
 | `--ffn_dim D`         | `480`          | matches the NVIDIA reference                         |
 | `--topk K`            | `8`            |                                                      |
@@ -69,16 +114,24 @@ Optional knobs the test honours:
 | `--warmup N`/`--iters N` | `2`/`3`     | functional sanity sweep                              |
 | `--skip_backward`     | off            | run forward only (handy while bisecting comms)       |
 
-For `--ntokens 4096` (the full NVIDIA-default shape), bump the
-symmetric heap with `ROCSHMEM_HEAP_SIZE=2147483648` (2 GiB / PE)
-before invoking the launcher:
+For `--ntokens 2048` and above the symmetric heap must be ≥ 8 GiB per PE
+(the EpAll2AllOp allocator prints its exact requirement on first init —
+e.g. `7357.64 MB` for ntokens=2048 with the default hidden/ffn/topk).
+The launcher sets `ROCSHMEM_HEAP_SIZE=512MB` by default which is **only
+enough for `--ntokens ≤ 1024`**; override before invoking it:
 
 ```bash
-ROCSHMEM_HEAP_SIZE=2147483648 \
+ulimit -l unlimited                      # default container memlock is 8 MiB
+ROCSHMEM_HEAP_SIZE=8589934592 \          # 8 GiB; bump for --ntokens 4096+
 TRITON_DIST_SHMEM_BACKEND=rocshmem \
     bash ./scripts/launch_amd.sh \
-         ./python/triton_dist/test/amd/test_ep_moe_fused.py --ntokens 4096
+         ./python/triton_dist/test/amd/test_ep_moe_fused.py --ntokens 2048
 ```
+
+`ROCSHMEM_HEAP_SIZE` only takes effect at `rocshmem_init_attr` time; the
+allocator's `[EpAll2AllOp] ROCSHMEM_HEAP_SIZE is updated to ...` log
+line is a no-op (the heap is already pinned). Override the env var
+upfront.
 
 Expected output (truncated, MI355X / gfx950, 8 ranks):
 

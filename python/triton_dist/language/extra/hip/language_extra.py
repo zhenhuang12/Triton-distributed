@@ -356,6 +356,19 @@ def store(ptr, val, scope="agent", semantic="monotonic", _semantic=None):
 
 
 @core.extern
+def s_sleep(N: core.constexpr = core.constexpr(0), _semantic=None):
+    return core.inline_asm_elementwise(
+        asm=f"s_sleep {N.value}",
+        constraints="=r",
+        args=[],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
 def sync_grid(_semantic=None):
     return dist_core.extern_elementwise(
         "",

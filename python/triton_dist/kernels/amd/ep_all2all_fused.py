@@ -274,7 +274,7 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                               bytes_per_token)
                 __syncthreads()
                 if thread_idx == 0:
-                    st(barriers_ptr + tile_id, 1, scope="gpu", semantic="release")
+                    st(barriers_ptr + tile_id, 1, scope="gpu", semantic="relaxed")
         else:
             for expert_idx in range(pid - num_pid, experts_per_rank, num_tail_sms):
                 recv_token_cur_expert = ld(num_recv_tokens_per_expert + rank * experts_per_rank + expert_idx)
@@ -292,7 +292,7 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                               bytes_per_token)
                 __syncthreads()
                 if thread_idx == 0:
-                    st(barriers_ptr + expert_idx, 1, scope="gpu", semantic="release")
+                    st(barriers_ptr + expert_idx, 1, scope="gpu", semantic="relaxed")
 
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=1)
@@ -372,9 +372,9 @@ def tile_kernel_gather_combine_token_intra_node(
                     if NEED_WAIT:
                         barrier_n_idx = elem_idx * VEC_SIZE // BARRIER_TOKEN_BLOCK_SIZE
                         barrier_idx = token_scatter_idx * N_BARRIERS_PER_TOKEN + barrier_n_idx
-                        token = ld(remote_barriers_ptr + barrier_idx, scope="sys", semantic="acquire")
+                        token = ld(remote_barriers_ptr + barrier_idx, scope="sys", semantic="relaxed")
                         while token != 1:
-                            token = ld(remote_barriers_ptr + barrier_idx, scope="sys", semantic="acquire")
+                            token = ld(remote_barriers_ptr + barrier_idx, scope="sys", semantic="relaxed")
 
                         remote_input_ptr = consume_token(token, remote_input_ptr)
 
@@ -460,7 +460,7 @@ def tile_kernel_scatter_token_intra_node(
                 remote_gate_output_ptr = dl.symm_at(gate_output_buf, from_rank)
                 gate_val = tl.load(gate_input_buf + token_idx)
                 tl.store(remote_gate_output_ptr + input_token_idx, gate_val)
-            while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="acquire") != 1:
+            while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="relaxed") != 1:
                 pass
 
             remote_output_ptr = dl.symm_at(scatter_send_buf, from_rank)
@@ -655,17 +655,17 @@ def tile_kernel_moe_grouped_gemm_nk_const(
             if USE_BLOCK_WISE_BARRIER:
                 barrier_idx = local_pid_m + tile_begin
                 if thread_idx == 0:
-                    while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="acquire") != 1:
+                    while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="relaxed") != 1:
                         pass
                 __syncthreads()
             else:
                 barrier_idx = expert_id
-                while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="acquire") != 1:
+                while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="relaxed") != 1:
                     pass
         else:
             if thread_idx < world_size:
                 barrier_idx = expert_id * world_size + thread_idx
-                while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="acquire") != 1:
+                while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="relaxed") != 1:
                     pass
             __syncthreads()
         if ENABLE_PROFILING:
@@ -709,7 +709,7 @@ def tile_kernel_moe_grouped_gemm_nk_const(
         thread_idx = tid(0)
         valid_tokens = min(row_remain, BLOCK_SIZE_M)
         if thread_idx < valid_tokens:
-            st(barriers_ptr + (token_begin + thread_idx) * num_block_n + pid_n, 1, scope="gpu", semantic="release")
+            st(barriers_ptr + (token_begin + thread_idx) * num_block_n + pid_n, 1, scope="gpu", semantic="relaxed")
 
         if ENABLE_PROFILING:
             profiler = profiler.record(is_start=False, task_type=5)
