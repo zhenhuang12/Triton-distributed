@@ -63,6 +63,77 @@ Pick mori_shmem for perf, rocshmem only if you specifically need
 its features (e.g. multi-node GDA / RO) or want to bisect against
 a second backend.
 
+### DeepSeek-V4 model shapes via `MODEL=` preset
+
+The wrapper accepts a `MODEL=` env that overrides
+`--hidden_dim / --ffn_dim / --topk / --num_experts`. Shapes are
+sourced from [`BenchMoE/model_configs.json`](../../BenchMoE/model_configs.json)
+(`moe_intermediate_size` → `--ffn_dim`, `num_topk` → `--topk`):
+
+| `MODEL=` | hidden | ffn  | topk | experts |
+|---|---:|---:|---:|---:|
+| (unset / `default`)   | 1536 |  480 | 8 |  64 |
+| `deepseek-v4-flash`   | 4096 | 2048 | 6 | 256 |
+| `deepseek-v4-pro`     | 7168 | 3072 | 6 | 384 |
+
+**The wrapper's default 8 GiB heap is too small for the V4 shapes** —
+bump `MORI_SHMEM_HEAP_SIZE` / `MORI_SHMEM_SYMMETRIC_SIZE` (or
+`ROCSHMEM_HEAP_SIZE`) before launching. Verified working values for
+the full ntokens=1024→8192 sweep on 8× MI355X with mori_shmem:
+
+```bash
+# DeepSeek-V4-Flash (needs ≥32 GiB symmetric heap)
+docker exec dev_primus bash -lc \
+  "cd /apps/zhuang12/MegaKernel/Triton-distributed && \
+   MODEL=deepseek-v4-flash TRITON_DIST_SHMEM_BACKEND=mori_shmem \
+   MORI_SHMEM_HEAP_SIZE=34359738368 MORI_SHMEM_SYMMETRIC_SIZE=34359738368 \
+   WARMUP=2 ITERS=5 ./run_amd_mega_moe.sh"
+
+# DeepSeek-V4-Pro (needs ≥64 GiB symmetric heap)
+docker exec dev_primus bash -lc \
+  "cd /apps/zhuang12/MegaKernel/Triton-distributed && \
+   MODEL=deepseek-v4-pro TRITON_DIST_SHMEM_BACKEND=mori_shmem \
+   MORI_SHMEM_HEAP_SIZE=68719476736 MORI_SHMEM_SYMMETRIC_SIZE=68719476736 \
+   WARMUP=2 ITERS=5 ./run_amd_mega_moe.sh"
+```
+
+Baseline tail (8 × MI355X / gfx950, EP=8, mori_shmem, WARMUP=2 ITERS=5,
+2026-05-25, format `latency(ms)/peak_mem(MB)/precision`):
+
+```
+# DeepSeek-V4-Flash (topk=6, num_experts=256)
+ Ntokens   Hidden      FFN  triton_dist_fwd  triton_dist_fwd_bwd
+==================================================================
+    1024     4096     2048   1.605/  30.49/✅   5.394/1582.02/✅
+    2048     4096     2048   1.717/  47.46/✅   5.860/1615.59/✅
+    4096     4096     2048   2.275/  79.90/✅   6.960/1680.85/✅
+    8192     4096     2048   3.271/ 137.04/✅   9.259/1795.13/✅
+
+# DeepSeek-V4-Pro (topk=6, num_experts=384)
+ Ntokens   Hidden      FFN  triton_dist_fwd  triton_dist_fwd_bwd
+==================================================================
+    1024     7168     3072   2.777/  38.96/✅  14.716/6110.96/✅
+    2048     7168     3072   2.985/  61.96/✅  15.571/6157.06/✅
+    4096     7168     3072   3.359/ 121.47/✅  16.030/6275.98/✅
+    8192     7168     3072   4.530/ 215.73/✅  19.564/6464.51/✅
+```
+
+Cross-shape observations vs the canonical (1536/480/8/64) smoke shape:
+
+- **fwd scales sub-linearly with `ntokens`** for the V4 shapes — at
+  ntokens=8192 the fwd path is only ~2× the ntokens=1024 number
+  (V4-Flash: 3.27/1.60 = 2.04×; V4-Pro: 4.53/2.78 = 1.63×) because
+  the per-token compute dwarfs the fixed dispatch overhead.
+- **fwd+bwd is bwd-dominated for V4-Pro.** fwd is 23 % of fwd+bwd at
+  ntokens=8192 (4.53 / 19.56 ms); the bwd weight-grad GEMMs scale
+  with `hidden² × experts` and they are the long pole here.
+- **Peak memory for fwd+bwd jumps ~3.7× from V4-Flash to V4-Pro**
+  (1.8 GB → 6.5 GB at ntokens=8192) — driven by activations being
+  saved for bwd at the larger hidden/expert count, not by the
+  symmetric heap (which the wrapper provisions independently).
+- All 8 rows are `✅` — no precision regression on either shape with
+  the mori backend.
+
 ## Skip `pip install` — C++ extensions are pre-built
 
 This checkout already contains:

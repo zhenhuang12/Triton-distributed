@@ -42,6 +42,34 @@ NTOKENS=${NTOKENS:-8192}  # matches test_ep_moe_fused.py default; sweeps 1024..N
 WARMUP=${WARMUP:-5}
 ITERS=${ITERS:-15}
 
+# Optional MODEL preset overrides --hidden_dim / --ffn_dim / --topk /
+# --num_experts. Shapes are pulled from BenchMoE/model_configs.json
+# (moe_intermediate_size -> ffn_dim, num_topk -> topk).
+#   default                -> test_ep_moe_fused.py defaults (1536/480/8/64)
+#   deepseek-v3            -> 7168/2048/8/256
+#   deepseek-v4-flash      -> 4096/2048/6/256
+#   deepseek-v4-pro        -> 7168/3072/6/384
+MODEL=${MODEL:-default}
+case "${MODEL}" in
+    default)
+        MODEL_ARGS=()
+        ;;
+    deepseek-v3|DeepSeek-V3)
+        MODEL_ARGS=(--hidden_dim 7168 --ffn_dim 2048 --topk 8 --num_experts 256)
+        ;;
+    deepseek-v4-flash|DeepSeek-V4-Flash)
+        MODEL_ARGS=(--hidden_dim 4096 --ffn_dim 2048 --topk 6 --num_experts 256)
+        ;;
+    deepseek-v4-pro|DeepSeek-V4-Pro)
+        MODEL_ARGS=(--hidden_dim 7168 --ffn_dim 3072 --topk 6 --num_experts 384)
+        ;;
+    *)
+        echo "MODEL='${MODEL}' not recognized; valid: default, deepseek-v3, deepseek-v4-flash, deepseek-v4-pro" >&2
+        exit 1
+        ;;
+esac
+
 exec bash ./scripts/launch_amd.sh \
     ./python/triton_dist/test/amd/test_ep_moe_fused.py \
-    --ntokens "${NTOKENS}" --warmup "${WARMUP}" --iters "${ITERS}" "$@"
+    --ntokens "${NTOKENS}" --warmup "${WARMUP}" --iters "${ITERS}" \
+    "${MODEL_ARGS[@]}" "$@"
