@@ -53,8 +53,12 @@ import datetime
 import gc
 import os
 import torch
+import torch.nn.functional as F
 from contextlib import nullcontext
 from torch.profiler import profile, ProfilerActivity
+
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.ops import grouped_gemm
 
 from triton_dist.function import (
     TritonDistFusedEpMoeFunction,
@@ -91,7 +95,7 @@ def _install_kernel_profile_aggregator():
     _original_export = _layer.export_to_perfetto_trace
 
     def _wrapped_export(profiler_buffer, task_names, file_name, *args, **kwargs):
-        try:
+        try: 
             tracks = parse_to_tracks(profiler_buffer)
             kernel_label = os.path.basename(file_name)
             bucket = _KERNEL_PROFILE_STATS.setdefault(kernel_label, {})
@@ -197,7 +201,12 @@ def prepare_inputs(
     Returns:
         Tuple of (weights, activations, grad_output)
         - weights: (fc1_1, fc1_2, fc2) - expert weights
-        - activations: (hidden_states, gate_weights, expert_index, ntokens_per_rank_list)
+        - activations: (hidden_states, gate_weights, expert_index, ntokens_per_rank_list, gate_logits)
+          - gate_logits is the dense [ntokens, num_experts] probs tensor that
+            DeepEPTokenDispatcher.token_dispatch expects; it is pre-scattered
+            so dispatcher's internal ``gate_logits.gather(1, expert_index)``
+            reproduces ``gate_weights`` byte-exact — lets turbo_ep_moe skip
+            the per-call scatter.
         - grad_output: Gradient for backward pass
     """
     assert len(ntokens_per_rank_list) == num_ranks
@@ -222,9 +231,25 @@ def prepare_inputs(
     gate_weights = torch.randn_like(topk_res.values, dtype=dtype, device=device).float()
     expert_index = topk_res.indices.to(torch.int32)
 
+    # Build the dense probs tensor turbo's DeepEPTokenDispatcher expects.
+    # Scattering once here (instead of inside turbo_ep_moe every call) lets
+    # the baseline path skip the per-call scatter — the dispatcher does
+    # ``gate_logits.gather(1, expert_index)`` internally to recover
+    # ``gate_weights``. Overwrites the raw topk source above; the topk
+    # decision is already captured in ``expert_index``.
+    gate_logits = torch.zeros(
+        ntokens_per_rank_list[rank], num_experts, dtype=torch.float32, device=device
+    )
+    gate_logits.scatter_(1, expert_index.long(), gate_weights.float())
+
     # Randomly drop some tokens (set expert_index to num_experts)
-    random_drop_tokens = torch.randint(0, 10, [ntokens_per_rank_list[rank], topk], device=device)
-    expert_index = expert_index.masked_fill(random_drop_tokens > 9, num_experts)
+    # NOTE: disabled — the fused kernel treats expert_index == num_experts as a
+    # drop sentinel, but the turbo baseline (DeepEPTokenDispatcher + grouped_gemm)
+    # has no drop semantics and would index out of bounds. Keeping all topk slots
+    # valid lets both paths share the exact same routing without the
+    # mask-and-zero-prob workaround in turbo_ep_moe().
+    # random_drop_tokens = torch.randint(0, 10, [ntokens_per_rank_list[rank], topk], device=device)
+    # expert_index = expert_index.masked_fill(random_drop_tokens > 9, num_experts)
 
     hidden_states = torch.randn([ntokens_per_rank_list[rank], hidden_dim], dtype=dtype, device=device) * 0.1
     grad_output = torch.randn([ntokens_per_rank_list[rank], hidden_dim], dtype=dtype, device=device)
@@ -239,7 +264,7 @@ def prepare_inputs(
 
     return (
         (fc1_1, fc1_2, fc2),
-        (hidden_states, gate_weights, expert_index, ntokens_per_rank_list),
+        (hidden_states, gate_weights, expert_index, ntokens_per_rank_list, gate_logits),
         grad_output,
     )
 
@@ -247,12 +272,51 @@ def prepare_inputs(
 def triton_dist_moe_func(weights, activations, ep_group):
     """Triton-dist MoE forward function"""
     fc1_1, fc1_2, fc2 = weights
-    hidden_states, gate_weights, expert_index, ntokens_per_rank_list = activations
+    hidden_states, gate_weights, expert_index, ntokens_per_rank_list, _ = activations
     assert len(fc1_1.shape) == 3
     num_experts = fc1_1.shape[0] * ep_group.size()  # total experts
     output = TritonDistFusedEpMoeFunction.apply(num_experts, gate_weights, expert_index, hidden_states, fc1_1, fc1_2,
                                                 fc2, ep_group)
     return output
+
+
+def turbo_ep_moe(weights, activations, dispatcher):
+    """Baseline EP-MoE forward: turbo TokenDispatcher + turbo grouped_gemm + SwiGLU.
+
+    Uses the same expert_index that the fused kernel sees (passed through
+    ``indices=`` so the topk routing decision is identical) — only the
+    dispatch + compute path differs.
+    """
+    fc1_1, fc1_2, fc2 = weights
+    hidden_states, _, expert_index, _, gate_logits = activations
+
+    # prepare_inputs pre-scatters gate_weights into the dense [ntokens,
+    # num_experts] probs tensor that DeepEPTokenDispatcher expects;
+    # internally token_dispatch does gate_logits.gather(1, indices) to
+    # recover the topk weights, so we skip the per-call scatter here.
+    permuted_hidden, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
+        hidden_states, gate_logits, indices=expert_index.long()
+    )
+
+    group_lens = tokens_per_expert.to(device=hidden_states.device, dtype=torch.int64)
+
+    # Megatron + Primus-Turbo uses a single pre-concatenated [gate; up] fc1
+    # weight per expert and runs ONE grouped_gemm for fc1
+    # (see PrimusTurboGroupedLinear.forward_internal). Force that path here:
+    # if the caller handed us split weights, concat first.
+    if fc1_2 is not None:
+        fc1 = torch.cat([fc1_1, fc1_2], dim=1)
+    else:
+        fc1 = fc1_1
+    fc1_out = grouped_gemm(permuted_hidden, fc1, group_lens, trans_b=True)
+    gate, up = fc1_out.chunk(2, dim=-1)
+
+    # Apply routing weight inside SwiGLU to mirror the fused kernel's swiglu_forward(scale=...).
+    intermediate = (F.silu(gate.float()) * up.float() * permuted_probs.unsqueeze(-1)).to(hidden_states.dtype)
+
+    fc2_out = grouped_gemm(intermediate, fc2, group_lens, trans_b=True)
+
+    return dispatcher.token_combine(fc2_out)
 
 
 def uniform_split_tokens(ntokens, nsplits):
@@ -331,6 +395,15 @@ def main():
         capacity=args.capacity,
     )
 
+    # Initialize turbo TokenDispatcher (baseline: turbo dispatcher + grouped_gemm).
+    turbo_dispatcher = turbo.modules.DeepEPTokenDispatcher(
+        num_experts=args.num_experts,
+        router_topk=args.topk,
+        ep_group=EP_GROUP,
+        permute_fusion=True,
+        deepep_num_use_cu=80,
+    )
+
     # Optionally turn on the in-kernel profiler. Each fwd/bwd dispatch &
     # combine call will then allocate a ProfilerBuffer, record per-task
     # start/end timestamps inside the device kernel, write a
@@ -355,6 +428,9 @@ def main():
     # Test configurations
     test_configs = []
     ntokens_list = [1024, 2048, 4096, 8192, 8192 * 2, 8192 * 4, 8192 * 8, 8192 * 16, 8192 * 32]
+    _min_ntokens = int(os.environ.get("EP_NTOKENS_MIN", "0"))
+    if _min_ntokens > 0:
+        ntokens_list = [n for n in ntokens_list if n >= _min_ntokens]
     hidden_dim_list = [args.hidden_dim]
     ffn_dim_list = [args.ffn_dim]
     concat_weights_list = [False, True]
@@ -374,9 +450,16 @@ def main():
         if args.profile:
             os.makedirs("prof/test_moe", exist_ok=True)
             trace_filename = f"prof/test_moe/moe_trace_rank{rank}.json"
+            # One prof.step() per config, so the schedule's step budget
+            # must fit len(test_configs). Use wait=0/warmup=0 and size
+            # active to cover every config; otherwise narrow sweeps
+            # (e.g. EP_NTOKENS_MIN filtering down to 1-2 configs) never
+            # reach the active window and the exported trace is empty.
             ctx = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                          schedule=torch.profiler.schedule(wait=1, warmup=2, active=5,
-                                                           repeat=1), record_shapes=True, profile_memory=True)
+                          schedule=torch.profiler.schedule(wait=0, warmup=0,
+                                                           active=max(1, len(test_configs)),
+                                                           repeat=1),
+                          record_shapes=True, profile_memory=True)
         else:
             ctx = nullcontext()
         with ctx as prof:
@@ -408,11 +491,14 @@ def main():
                 torch.distributed.barrier(EP_GROUP)
 
                 fc1_1, fc1_2, fc2 = weights
-                hidden_states, gate_weights, expert_index, _ = activations
+                hidden_states, gate_weights, expert_index, _, _ = activations
 
                 # Benchmark functions
                 def triton_dist_fwd():
                     return triton_dist_moe_func(weights, activations, EP_GROUP)
+
+                def turbo_fwd():
+                    return turbo_ep_moe(weights, activations, turbo_dispatcher)
 
                 def zero_grads():
                     if fc1_1.grad is not None:
@@ -441,6 +527,10 @@ def main():
                     triton_dist_fwd_bwd_time, triton_dist_fwd_bwd_mem = benchmark_latency_memory(
                         triton_dist_fwd_bwd, args.iters, args.warmup, pre_func=zero_grads)
 
+                with torch.no_grad():
+                    turbo_fwd_time, turbo_fwd_mem = benchmark_latency_memory(
+                        turbo_fwd, args.iters, args.warmup)
+
                 # Precision check: use the same inputs for both implementations
                 # Prepare reference inputs once and clone for both implementations
                 weights_ref, activations_ref, grad_output_ref = prepare_inputs(
@@ -459,7 +549,7 @@ def main():
                 torch.distributed.barrier(EP_GROUP)
 
                 fc1_1_ref, fc1_2_ref, fc2_ref = weights_ref
-                hidden_states_ref, gate_weights_ref, expert_index_ref, _ = activations_ref
+                hidden_states_ref, gate_weights_ref, expert_index_ref, _, _ = activations_ref
 
                 # Clone inputs for triton_dist (to avoid modifying original tensors)
                 fc1_1_triton_dist = fc1_1_ref.clone().detach().requires_grad_(True)
@@ -472,7 +562,7 @@ def main():
 
                 weights_triton_dist = (fc1_1_triton_dist, fc1_2_triton_dist, fc2_triton_dist)
                 activations_triton_dist = (hidden_states_triton_dist, gate_weights_triton_dist,
-                                           expert_index_triton_dist, token_splits)
+                                           expert_index_triton_dist, token_splits, None)
 
                 output_triton_dist = triton_dist_moe_func(weights_triton_dist, activations_triton_dist, EP_GROUP)
                 if not args.skip_backward:
@@ -493,6 +583,9 @@ def main():
                 implementations['triton_dist_fwd_bwd'] = {
                     'latency': triton_dist_fwd_bwd_time, 'memory': triton_dist_fwd_bwd_mem, 'precision':
                     bwd_precision if output_triton_dist is not None else 'N/A'
+                }
+                implementations['turbo_fwd'] = {
+                    'latency': turbo_fwd_time, 'memory': turbo_fwd_mem, 'precision': 'N/A'
                 }
 
                 config_key = (ntokens, hidden_dim, ffn_dim)
@@ -528,6 +621,22 @@ def main():
         print_benchmark_comparison(
             all_implementations, "Expert Parallel MoE", param_names=['Ntokens', 'Hidden', 'FFN'],
             title_params={'SM_margin': args.sm_margin, 'topk': args.topk, 'num_experts': args.num_experts})
+
+        # Perf table: triton_dist throughput as a fraction of turbo_fwd
+        # (turbo_lat / triton_dist_lat — lower latency is better, so <1.0x
+        # means triton_dist is slower than turbo; e.g. 0.50x = half the perf).
+        print()
+        print("Perf vs turbo_fwd baseline (turbo_lat / triton_dist_lat; <1.0x = slower than turbo)")
+        print(f"{'Ntokens':>8} {'Hidden':>8} {'FFN':>8} {'fwd_perf':>12} {'fwd_bwd_perf':>14}")
+        print("=" * 56)
+        for config_key, impls in all_implementations.items():
+            ntokens_v, hidden_v, ffn_v = config_key
+            turbo_lat = impls.get('turbo_fwd', {}).get('latency')
+            td_fwd_lat = impls.get('triton_dist_fwd', {}).get('latency')
+            td_fb_lat = impls.get('triton_dist_fwd_bwd', {}).get('latency')
+            fwd_p = f"{turbo_lat / td_fwd_lat:.3f}x" if turbo_lat and td_fwd_lat else "N/A"
+            fb_p = f"{turbo_lat / td_fb_lat:.3f}x" if turbo_lat and td_fb_lat else "N/A"
+            print(f"{ntokens_v:>8} {hidden_v:>8} {ffn_v:>8} {fwd_p:>12} {fb_p:>14}")
 
     if args.enable_kernel_profiler:
         _print_kernel_profile_summary(rank)

@@ -27,6 +27,7 @@ import argparse
 import datetime
 import os
 import torch
+import torch.nn.functional as F
 from contextlib import nullcontext
 from torch.profiler import profile, ProfilerActivity
 
@@ -34,6 +35,9 @@ from triton_dist.function.nvidia.common import init_triton_dist_ep_op, deinit_tr
 from triton_dist.function.nvidia.ep_moe_fused import TritonDistFusedEpMoeFunction
 from triton_dist.utils import finalize_distributed, init_nvshmem_by_torch_process_group
 from triton_dist.profiler_utils import benchmark_latency_memory, print_benchmark_comparison
+
+import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.ops import grouped_gemm
 
 
 def parse_args():
@@ -144,6 +148,51 @@ def triton_dist_moe_func(weights, activations, ep_group):
     return output
 
 
+def turbo_ep_moe(weights, activations, dispatcher):
+    """Baseline EP-MoE forward: turbo TokenDispatcher + turbo grouped_gemm + SwiGLU.
+
+    expert_index from activations is forwarded to dispatcher.token_dispatch via
+    `indices=`, so the topk routing decision is byte-identical to what the fused
+    kernel sees — only the dispatch / compute path differs.
+    """
+    fc1_1, fc1_2, fc2 = weights
+    hidden_states, gate_weights, expert_index, _ = activations
+    num_experts = dispatcher.num_experts
+    ntokens = hidden_states.shape[0]
+
+    # token_dispatch expects probs shaped [ntokens, num_experts]; scatter the
+    # per-topk gate_weights back into a dense tensor at the expert_index slots.
+    # Mask out drops (expert_index == num_experts) by zeroing both index and weight.
+    valid = expert_index < num_experts
+    safe_idx = expert_index.long().masked_fill(~valid, 0)
+    probs = torch.zeros(ntokens, num_experts, dtype=torch.float32, device=hidden_states.device)
+    probs.scatter_(1, safe_idx, gate_weights.float() * valid.float())
+
+    permuted_hidden, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
+        hidden_states, probs, indices=safe_idx
+    )
+
+    group_lens = tokens_per_expert.to(device=hidden_states.device, dtype=torch.int64)
+
+    # Megatron + Primus-Turbo uses a single pre-concatenated [gate; up] fc1
+    # weight per expert and runs ONE grouped_gemm for fc1
+    # (see PrimusTurboGroupedLinear.forward_internal). Force that path here:
+    # if the caller handed us split weights, concat first.
+    if fc1_2 is not None:
+        fc1 = torch.cat([fc1_1, fc1_2], dim=1)
+    else:
+        fc1 = fc1_1
+    fc1_out = grouped_gemm(permuted_hidden, fc1, group_lens, trans_b=True)
+    gate, up = fc1_out.chunk(2, dim=-1)
+
+    # Apply routing weight inside SwiGLU to mirror the fused kernel's swiglu_forward(scale=...).
+    intermediate = (F.silu(gate.float()) * up.float() * permuted_probs.unsqueeze(-1)).to(hidden_states.dtype)
+
+    fc2_out = grouped_gemm(intermediate, fc2, group_lens, trans_b=True)
+
+    return dispatcher.token_combine(fc2_out)
+
+
 def uniform_split_tokens(ntokens, nsplits):
     """Uniformly split tokens across ranks"""
     ret = [ntokens // nsplits for _ in range(nsplits)]
@@ -213,6 +262,14 @@ def main():
         capacity=args.capacity,
     )
 
+    # Initialize turbo TokenDispatcher (baseline: turbo dispatcher + grouped_gemm).
+    turbo_dispatcher = turbo.modules.DeepEPTokenDispatcher(
+        num_experts=args.num_experts,
+        router_topk=args.topk,
+        ep_group=EP_GROUP,
+        permute_fusion=True,
+    )
+
     # Test configurations
     test_configs = []
     ntokens_list = [1024, 2048, 4096, 8192, 8192 * 2, 8192 * 4, 8192 * 8, 8192 * 16, 8192 * 32]
@@ -275,6 +332,9 @@ def main():
                 def triton_dist_fwd():
                     return triton_dist_moe_func(weights, activations, EP_GROUP)
 
+                def turbo_fwd():
+                    return turbo_ep_moe(weights, activations, turbo_dispatcher)
+
                 def zero_grads():
                     if fc1_1.grad is not None:
                         fc1_1.grad.zero_()
@@ -300,6 +360,10 @@ def main():
                     triton_dist_fwd, args.iters, args.warmup)
                 triton_dist_fwd_bwd_time, triton_dist_fwd_bwd_mem = benchmark_latency_memory(
                     triton_dist_fwd_bwd, args.iters, args.warmup, pre_func=zero_grads)
+
+                with torch.no_grad():
+                    turbo_fwd_time, turbo_fwd_mem = benchmark_latency_memory(
+                        turbo_fwd, args.iters, args.warmup)
 
                 # Precision check: use the same inputs for both implementations
                 # Prepare reference inputs once and clone for both implementations
@@ -353,6 +417,9 @@ def main():
                     'latency': triton_dist_fwd_bwd_time, 'memory': triton_dist_fwd_bwd_mem, 'precision':
                     bwd_precision if output_triton_dist is not None else 'N/A'
                 }
+                implementations['turbo_fwd'] = {
+                    'latency': turbo_fwd_time, 'memory': turbo_fwd_mem, 'precision': 'N/A'
+                }
 
                 config_key = (ntokens, hidden_dim, ffn_dim)
                 all_implementations[config_key] = implementations
@@ -374,6 +441,19 @@ def main():
         print_benchmark_comparison(
             all_implementations, "Expert Parallel MoE", param_names=['Ntokens', 'Hidden', 'FFN'],
             title_params={'SM_margin': args.sm_margin, 'topk': args.topk, 'num_experts': args.num_experts})
+
+        # Ratio table: triton_dist vs turbo_fwd baseline (denominator = turbo_fwd)
+        print()
+        print(f"{'Ntokens':>8} {'Hidden':>8} {'FFN':>8} {'fwd_ratio':>12} {'fwd_bwd_ratio':>14}")
+        print("=" * 56)
+        for config_key, impls in all_implementations.items():
+            ntokens_v, hidden_v, ffn_v = config_key
+            turbo_lat = impls.get('turbo_fwd', {}).get('latency')
+            td_fwd_lat = impls.get('triton_dist_fwd', {}).get('latency')
+            td_fb_lat = impls.get('triton_dist_fwd_bwd', {}).get('latency')
+            fwd_r = f"{td_fwd_lat / turbo_lat:.3f}x" if turbo_lat and td_fwd_lat else "N/A"
+            fb_r = f"{td_fb_lat / turbo_lat:.3f}x" if turbo_lat and td_fb_lat else "N/A"
+            print(f"{ntokens_v:>8} {hidden_v:>8} {ffn_v:>8} {fwd_r:>12} {fb_r:>14}")
 
 
 if __name__ == "__main__":

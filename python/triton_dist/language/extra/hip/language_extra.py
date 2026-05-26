@@ -321,6 +321,55 @@ def st(
 
 
 @core.extern
+def _memory_barrier(_semantic=None):
+    # s_waitcnt drains LDS+VMEM; ~{memory} clobber adds a bidirectional
+    # LLVM compiler barrier (== signal_fence(SEQ_CST)).
+    return core.inline_asm_elementwise(
+        asm="s_waitcnt lgkmcnt(0) vmcnt(0)",
+        constraints="=r,~{memory}",
+        args=[],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def _compiler_barrier(_semantic=None):
+    # Empty asm with ~{memory} clobber == __atomic_signal_fence(SEQ_CST):
+    # no instructions emitted, just forbids LLVM from reordering memory ops
+    # across this point. Needed because st/ld are lowered to LLVM atomic
+    # intrinsics (see BuiltinFuncToLLVMExt.cpp), which the optimizer can
+    # otherwise reorder around.
+    return core.inline_asm_elementwise(
+        asm="",
+        constraints="=r,~{memory}",
+        args=[],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def st_release(ptr, val, scope: core.constexpr = "sys"):
+    # kUseCheapFence branch of st_release_sys_global in Primus-Turbo deep_ep/utils.cuh.
+    _memory_barrier()
+    st(ptr, val, scope=scope, semantic="relaxed")
+    _compiler_barrier()
+
+
+@triton.jit
+def ld_acquire(ptr, scope: core.constexpr = "sys"):
+    _memory_barrier()
+    val = ld(ptr, scope=scope, semantic="relaxed")
+    _compiler_barrier()
+    return val
+
+
+@core.extern
 def __syncthreads(_semantic=None):
     return core.extern_elementwise(
         "",
@@ -603,6 +652,8 @@ __all__ = [
     "__shfl_xor_sync_i32",
     "load",
     "store",
+    "st_release",
+    "ld_acquire",
     "sync_grid",
     "smid",
     "sync_grid",

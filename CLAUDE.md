@@ -63,7 +63,7 @@ Pick mori_shmem for perf, rocshmem only if you specifically need
 its features (e.g. multi-node GDA / RO) or want to bisect against
 a second backend.
 
-### DeepSeek-V4 model shapes via `MODEL=` preset
+### DeepSeek model shapes via `MODEL=` preset
 
 The wrapper accepts a `MODEL=` env that overrides
 `--hidden_dim / --ffn_dim / --topk / --num_experts`. Shapes are
@@ -73,15 +73,25 @@ sourced from [`BenchMoE/model_configs.json`](../../BenchMoE/model_configs.json)
 | `MODEL=` | hidden | ffn  | topk | experts |
 |---|---:|---:|---:|---:|
 | (unset / `default`)   | 1536 |  480 | 8 |  64 |
+| `deepseek-v3`         | 7168 | 2048 | 8 | 256 |
 | `deepseek-v4-flash`   | 4096 | 2048 | 6 | 256 |
 | `deepseek-v4-pro`     | 7168 | 3072 | 6 | 384 |
 
-**The wrapper's default 8 GiB heap is too small for the V4 shapes** —
+**The wrapper's default 8 GiB heap is too small for the V3/V4 shapes** —
 bump `MORI_SHMEM_HEAP_SIZE` / `MORI_SHMEM_SYMMETRIC_SIZE` (or
 `ROCSHMEM_HEAP_SIZE`) before launching. Verified working values for
 the full ntokens=1024→8192 sweep on 8× MI355X with mori_shmem:
 
 ```bash
+# DeepSeek-V3 (needs ≥64 GiB symmetric heap — topk=8 inflates dispatch
+# traffic vs the V4 shapes, peak symmetric heap ~35 GiB so 32 GiB does
+# NOT fit)
+docker exec dev_primus bash -lc \
+  "cd /apps/zhuang12/MegaKernel/Triton-distributed && \
+   MODEL=deepseek-v3 TRITON_DIST_SHMEM_BACKEND=mori_shmem \
+   MORI_SHMEM_HEAP_SIZE=68719476736 MORI_SHMEM_SYMMETRIC_SIZE=68719476736 \
+   WARMUP=2 ITERS=5 ./run_amd_mega_moe.sh"
+
 # DeepSeek-V4-Flash (needs ≥32 GiB symmetric heap)
 docker exec dev_primus bash -lc \
   "cd /apps/zhuang12/MegaKernel/Triton-distributed && \
@@ -97,42 +107,131 @@ docker exec dev_primus bash -lc \
    WARMUP=2 ITERS=5 ./run_amd_mega_moe.sh"
 ```
 
-Baseline tail (8 × MI355X / gfx950, EP=8, mori_shmem, WARMUP=2 ITERS=5,
-2026-05-25, format `latency(ms)/peak_mem(MB)/precision`):
+### `--ntokens` is GLOBAL; the report below is framed per-rank
+
+The wrapper's `NTOKENS=…` (and the test's `--ntokens`) is the
+**global** token count across all EP ranks — at EP=8, each rank sees
+`NTOKENS / 8` local tokens. The tables below are labelled by
+**local** tokens (the per-rank batch the kernel actually iterates
+over) with the global `NTOKENS` argument the wrapper was given in
+parentheses.
+
+To sweep only specific large batches without paying for the 1024..16384
+warmups, set `EP_NTOKENS_MIN=<global_min>` — the test
+([test_ep_moe_fused.py:357-361](python/triton_dist/test/amd/test_ep_moe_fused.py#L357-L361))
+drops anything below that.
+
+Baseline tail (8 × MI355X / gfx950, EP=8, mori_shmem, WARMUP=5 ITERS=15,
+default drop-MoE input, latency format `latency(ms)/peak_mem(MB)/precision`)
+— 2026-05-26, command
+`NTOKENS=131072 EP_NTOKENS_MIN=32768 MODEL=<m> ./run_amd_mega_moe.sh`.
+`triton_dist_*` is `ep_moe_fused` (this repo's mega-MoE kernel);
+`turbo_fwd` is the `turbo_ep_moe` baseline (DeepEPTokenDispatcher +
+primus_turbo grouped_gemm, fwd-only). `perf` columns are
+`turbo_lat / triton_dist_lat` — values **< 1.0× mean ep_moe_fused is
+slower than turbo** (lower latency = better).
+
+Numbers are tracked across optimisation rounds — the **v0** block
+below is the initial port, the **v3** block further down is the
+current head (round 3: every acquire-ordered `ld` and every
+release-ordered `st` on the cross-rank signal flags was swapped for
+the **cheap-fence** `ld_acquire` / `st_release` helpers in
+[`python/triton_dist/language/extra/hip/language_extra.py:356-369`](python/triton_dist/language/extra/hip/language_extra.py#L356-L369)).
+Keep both blocks intact when adding future rounds so regressions
+are visible against the historical lineage.
+
+### v2 — initial baseline:
 
 ```
-# DeepSeek-V4-Flash (topk=6, num_experts=256)
- Ntokens   Hidden      FFN  triton_dist_fwd  triton_dist_fwd_bwd
-==================================================================
-    1024     4096     2048   1.605/  30.49/✅   5.394/1582.02/✅
-    2048     4096     2048   1.717/  47.46/✅   5.860/1615.59/✅
-    4096     4096     2048   2.275/  79.90/✅   6.960/1680.85/✅
-    8192     4096     2048   3.271/ 137.04/✅   9.259/1795.13/✅
+# DeepSeek-V3 (topk=8, num_experts=256, hidden=7168, ffn=2048)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)  13.942/ 915.61/✅   6.395/1646.53/N/A   36.880/ 4499.51/✅    0.459x       0.173x
+   8192 (NTOKENS= 65536)  23.984/1804.34/✅  11.901/3278.93/N/A   66.160/ 6277.05/✅    0.496x       0.180x
+  16384 (NTOKENS=131072)  42.812/3544.72/✅  22.591/6486.17/N/A  119.521/ 9757.23/✅    0.528x       0.189x
 
-# DeepSeek-V4-Pro (topk=6, num_experts=384)
- Ntokens   Hidden      FFN  triton_dist_fwd  triton_dist_fwd_bwd
-==================================================================
-    1024     7168     3072   2.777/  38.96/✅  14.716/6110.96/✅
-    2048     7168     3072   2.985/  61.96/✅  15.571/6157.06/✅
-    4096     7168     3072   3.359/ 121.47/✅  16.030/6275.98/✅
-    8192     7168     3072   4.530/ 215.73/✅  19.564/6464.51/✅
+# DeepSeek-V4-Flash (topk=6, num_experts=256, hidden=4096, ffn=2048)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   9.011/ 510.64/✅   3.378/ 927.51/N/A   22.089/ 2542.37/✅    0.375x       0.153x
+   8192 (NTOKENS= 65536)  15.742/1034.64/✅   6.115/1912.02/N/A   40.424/ 3590.23/✅    0.388x       0.151x
+  16384 (NTOKENS=131072)  28.289/2068.33/✅  11.463/3850.35/N/A   75.594/ 5657.89/✅    0.405x       0.152x
+
+# DeepSeek-V4-Pro (topk=6, num_experts=384, hidden=7168, ffn=3072)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)  12.313/ 836.80/✅   7.050/1483.96/N/A   39.437/ 7706.69/✅    0.572x       0.179x
+   8192 (NTOKENS= 65536)  21.335/1667.89/✅  12.494/2986.19/N/A   65.615/ 9368.92/✅    0.586x       0.190x
+  16384 (NTOKENS=131072)  38.811/3281.83/✅  23.541/5896.12/N/A  117.173/12596.89/✅    0.607x       0.201x
 ```
 
-Cross-shape observations vs the canonical (1536/480/8/64) smoke shape:
+### v3 — cheap-fence `st_release` / `ld_acquire` (2026-05-26):
 
-- **fwd scales sub-linearly with `ntokens`** for the V4 shapes — at
-  ntokens=8192 the fwd path is only ~2× the ntokens=1024 number
-  (V4-Flash: 3.27/1.60 = 2.04×; V4-Pro: 4.53/2.78 = 1.63×) because
-  the per-token compute dwarfs the fixed dispatch overhead.
-- **fwd+bwd is bwd-dominated for V4-Pro.** fwd is 23 % of fwd+bwd at
-  ntokens=8192 (4.53 / 19.56 ms); the bwd weight-grad GEMMs scale
-  with `hidden² × experts` and they are the long pole here.
-- **Peak memory for fwd+bwd jumps ~3.7× from V4-Flash to V4-Pro**
-  (1.8 GB → 6.5 GB at ntokens=8192) — driven by activations being
-  saved for bwd at the larger hidden/expert count, not by the
-  symmetric heap (which the wrapper provisions independently).
-- All 8 rows are `✅` — no precision regression on either shape with
-  the mori backend.
+Same command, same shapes, same warmup/iters. Only change is in
+the cross-rank flag traffic: every `ld(..., semantic="acquire")`
+and `st(..., semantic="release")` on the dispatch / combine signal
+flags was replaced with the cheap-fence helpers
+`ld_acquire` / `st_release` from
+[`language_extra.py:356-369`](python/triton_dist/language/extra/hip/language_extra.py#L356-L369).
+
+What "cheap fence" actually is — each helper expands to
+
+```
+s_waitcnt lgkmcnt(0) vmcnt(0)   ; _memory_barrier()  -- drain LDS+VMEM
+<relaxed ld / st>               ; the actual flag access
+""  ~{memory}                   ; _compiler_barrier()  -- LLVM signal_fence
+```
+
+i.e. a hardware wait-counter drain plus a compiler-side memory
+clobber wrapping a *relaxed* atomic. Versus the previous
+acquire/release semantics, which LLVM lowers to atomic intrinsics
+that emit AMD cache-coherence ops (buffer invalidate / writeback on
+top of the same `s_waitcnt`). The cheap fence skips those L1/L2
+cache ops — correct here because the dispatch/combine flags are
+single-writer-many-reader on `sys` scope, so the data they guard is
+already coherent through the symmetric-heap path; we only need
+ordering, not cache management. This is the same trade-off as the
+`kUseCheapFence` branch of `st_release_sys_global` in Primus-Turbo's
+`deep_ep/utils.cuh`.
+
+turbo_fwd column is reproduced unchanged (it shares the run but its
+implementation didn't move) so the v3 vs v0 delta is purely on the
+`triton_dist_*` columns:
+
+```
+# DeepSeek-V3 (topk=8, num_experts=256, hidden=7168, ffn=2048)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   9.746/ 915.61/✅   6.374/1646.53/N/A   29.088/ 4499.51/✅    0.654x       0.219x
+   8192 (NTOKENS= 65536)  16.389/1804.34/✅  11.987/3278.93/N/A   49.627/ 6277.05/✅    0.731x       0.242x
+  16384 (NTOKENS=131072)  29.838/3544.72/✅  22.634/6486.17/N/A   90.534/ 9757.23/✅    0.759x       0.250x
+
+# DeepSeek-V4-Flash (topk=6, num_experts=256, hidden=4096, ffn=2048)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   6.076/ 510.64/✅   3.364/ 927.51/N/A   16.314/ 2542.37/✅    0.554x       0.206x
+   8192 (NTOKENS= 65536)  10.463/1034.64/✅   6.113/1912.02/N/A   29.173/ 3590.23/✅    0.584x       0.210x
+  16384 (NTOKENS=131072)  18.499/2068.33/✅  11.463/3850.35/N/A   53.156/ 5657.89/✅    0.620x       0.216x
+
+# DeepSeek-V4-Pro (topk=6, num_experts=384, hidden=7168, ffn=3072)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   9.300/ 836.80/✅   7.064/1483.96/N/A   33.351/ 7706.69/✅    0.760x       0.212x
+   8192 (NTOKENS= 65536)  15.871/1667.89/✅  12.448/2986.19/N/A   53.384/ 9368.92/✅    0.784x       0.233x
+  16384 (NTOKENS=131072)  29.518/3281.83/✅  23.616/5896.12/N/A   93.864/12596.89/✅    0.800x       0.252x
+```
+
+v3 / v2 speedup on `triton_dist_fwd` (lower latency in v3 / v2 latency;
+higher = better; peak_mem unchanged because the allocator and shapes
+didn't move):
+
+| Shape         | local 4096 | local 8192 | local 16384 |
+|---|---:|---:|---:|
+| V3            | 1.43×      | 1.46×      | 1.43×       |
+| V4-Flash      | 1.48×      | 1.50×      | 1.53×       |
+| V4-Pro        | 1.32×      | 1.34×      | 1.31×       |
+
+
 
 ## Skip `pip install` — C++ extensions are pre-built
 

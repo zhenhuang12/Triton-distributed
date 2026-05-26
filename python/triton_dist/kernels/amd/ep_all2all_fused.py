@@ -29,7 +29,7 @@ import triton_dist
 import triton.language as tl
 import triton_dist.language as dl
 from triton_dist.language.extra import libshmem_device
-from triton_dist.language.extra.hip.language_extra import (tid, atomic_add, __syncthreads, atomic_add_per_warp, st, ld)
+from triton_dist.language.extra.hip.language_extra import (tid, atomic_add, __syncthreads, atomic_add_per_warp, st, ld, st_release, ld_acquire)
 from .common_ops import barrier_on_this_grid, barrier_all_intra_node_atomic_cas_block, NVSHMEM_SIGNAL_DTYPE
 from triton_dist.tools.profiler import Profiler
 from .memory_ops import (load_v4, store_v4, zero_vec_f32, unpack_bf16x2_f32, pack_f32_bf16x2, copy_warp,
@@ -247,7 +247,7 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                 sync_warp()
                 if lane_idx == 0:
                     libshmem_device.fence()
-                    st(remote_token_indirect_pos + store_idx, has_sent, scope="sys", semantic="release")
+                    st_release(remote_token_indirect_pos + store_idx, has_sent, scope=tl.constexpr("sys"))
 
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=0)
@@ -267,23 +267,23 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                 num_tokens_this_tile = min(GEMM_BLOCK_SIZE_M, split_size - local_pid_m * GEMM_BLOCK_SIZE_M)
                 for token_offset in range(warp_id, num_tokens_this_tile, num_warps):
                     real_offset = row_begin + local_pid_m * GEMM_BLOCK_SIZE_M + token_offset
-                    has_sent = ld(token_indirect_pos_buf + real_offset, scope="sys", semantic="acquire")
+                    has_sent = ld_acquire(token_indirect_pos_buf + real_offset, scope=tl.constexpr("sys"))
                     while has_sent < 0:
-                        has_sent = ld(token_indirect_pos_buf + real_offset, scope="sys", semantic="acquire")
+                        has_sent = ld_acquire(token_indirect_pos_buf + real_offset, scope=tl.constexpr("sys"))
                     copy_warp(dispatch_output_local + real_offset * hidden_size, output_buf + has_sent * hidden_size,
                               bytes_per_token)
                 __syncthreads()
                 if thread_idx == 0:
-                    st(barriers_ptr + tile_id, 1, scope="gpu", semantic="relaxed")
+                    st_release(barriers_ptr + tile_id, 1, scope=tl.constexpr("gpu"))
         else:
             for expert_idx in range(pid - num_pid, experts_per_rank, num_tail_sms):
                 recv_token_cur_expert = ld(num_recv_tokens_per_expert + rank * experts_per_rank + expert_idx)
                 recv_offset_cur_expert = ld(expert_offs_ptr + expert_idx)
                 for recv_token_offset in range(warp_id, recv_token_cur_expert, num_warps):
                     real_offset = recv_offset_cur_expert + recv_token_offset
-                    has_sent = ld(token_indirect_pos_buf + real_offset, scope="sys", semantic="acquire")
+                    has_sent = ld_acquire(token_indirect_pos_buf + real_offset, scope=tl.constexpr("sys"))
                     while has_sent < 0:
-                        has_sent = ld(token_indirect_pos_buf + real_offset, scope="sys", semantic="acquire")
+                        has_sent = ld_acquire(token_indirect_pos_buf + real_offset, scope=tl.constexpr("sys"))
                     # let's keep this comment as a reminder
                     # the code in comments corresponds to no local copy
                     # if has_sent != real_offset:
@@ -292,7 +292,7 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                               bytes_per_token)
                 __syncthreads()
                 if thread_idx == 0:
-                    st(barriers_ptr + expert_idx, 1, scope="gpu", semantic="relaxed")
+                    st_release(barriers_ptr + expert_idx, 1, scope=tl.constexpr("gpu"))
 
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=1)
@@ -372,9 +372,9 @@ def tile_kernel_gather_combine_token_intra_node(
                     if NEED_WAIT:
                         barrier_n_idx = elem_idx * VEC_SIZE // BARRIER_TOKEN_BLOCK_SIZE
                         barrier_idx = token_scatter_idx * N_BARRIERS_PER_TOKEN + barrier_n_idx
-                        token = ld(remote_barriers_ptr + barrier_idx, scope="sys", semantic="relaxed")
+                        token = ld_acquire(remote_barriers_ptr + barrier_idx, scope=tl.constexpr("sys"))
                         while token != 1:
-                            token = ld(remote_barriers_ptr + barrier_idx, scope="sys", semantic="relaxed")
+                            token = ld_acquire(remote_barriers_ptr + barrier_idx, scope=tl.constexpr("sys"))
 
                         remote_input_ptr = consume_token(token, remote_input_ptr)
 
@@ -460,7 +460,7 @@ def tile_kernel_scatter_token_intra_node(
                 remote_gate_output_ptr = dl.symm_at(gate_output_buf, from_rank)
                 gate_val = tl.load(gate_input_buf + token_idx)
                 tl.store(remote_gate_output_ptr + input_token_idx, gate_val)
-            while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="relaxed") != 1:
+            while ld_acquire(barriers_ptr + barrier_idx, scope=tl.constexpr("gpu")) != 1:
                 pass
 
             remote_output_ptr = dl.symm_at(scatter_send_buf, from_rank)
@@ -472,7 +472,7 @@ def tile_kernel_scatter_token_intra_node(
             sync_warp()
             if lane_idx == 0:
                 libshmem_device.fence()
-                st(remote_scatter_output_barrier_buf + input_token_idx, 1, scope="sys", semantic="release")
+                st_release(remote_scatter_output_barrier_buf + input_token_idx, 1, scope=tl.constexpr("sys"))
 
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=0)
@@ -526,9 +526,9 @@ def tile_kernel_topk_reduce_token_intra_node(
                 if topk_index < num_experts:  # ignore dropped tokens
                     if lane_idx == 0:
                         # seg_idx = elem_idx * VEC_SIZE // BLOCK_SIZE
-                        val = ld(scatter_send_barrier_buf + (token_idx * topk + j), scope="sys", semantic="acquire")
+                        val = ld_acquire(scatter_send_barrier_buf + (token_idx * topk + j), scope=tl.constexpr("sys"))
                         while val < 0:
-                            val = ld(scatter_send_barrier_buf + (token_idx * topk + j), scope="sys", semantic="acquire")
+                            val = ld_acquire(scatter_send_barrier_buf + (token_idx * topk + j), scope=tl.constexpr("sys"))
             sync_warp()
 
         for elem_idx in range(lane_idx, hidden_size // VEC_SIZE, WARP_SIZE):
@@ -655,17 +655,17 @@ def tile_kernel_moe_grouped_gemm_nk_const(
             if USE_BLOCK_WISE_BARRIER:
                 barrier_idx = local_pid_m + tile_begin
                 if thread_idx == 0:
-                    while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="relaxed") != 1:
+                    while ld_acquire(barriers_ptr + barrier_idx, scope=tl.constexpr("gpu")) != 1:
                         pass
                 __syncthreads()
             else:
                 barrier_idx = expert_id
-                while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="relaxed") != 1:
+                while ld_acquire(barriers_ptr + barrier_idx, scope=tl.constexpr("gpu")) != 1:
                     pass
         else:
             if thread_idx < world_size:
                 barrier_idx = expert_id * world_size + thread_idx
-                while ld(barriers_ptr + barrier_idx, scope="gpu", semantic="relaxed") != 1:
+                while ld_acquire(barriers_ptr + barrier_idx, scope=tl.constexpr("gpu")) != 1:
                     pass
             __syncthreads()
         if ENABLE_PROFILING:
@@ -709,7 +709,7 @@ def tile_kernel_moe_grouped_gemm_nk_const(
         thread_idx = tid(0)
         valid_tokens = min(row_remain, BLOCK_SIZE_M)
         if thread_idx < valid_tokens:
-            st(barriers_ptr + (token_begin + thread_idx) * num_block_n + pid_n, 1, scope="gpu", semantic="relaxed")
+            st_release(barriers_ptr + (token_begin + thread_idx) * num_block_n + pid_n, 1, scope=tl.constexpr("gpu"))
 
         if ENABLE_PROFILING:
             profiler = profiler.record(is_start=False, task_type=5)
@@ -1741,15 +1741,16 @@ def kernel_get_ag_splits_and_recv_offset(
         full_splits_buf = dl.consume_token(full_splits_buf, token)
         __syncthreads()
         for expert_idx in range(thread_idx, num_experts, threads_per_block):
-            val = ld(full_splits_buf + target_rank * full_splits_buf_expert_stride + expert_idx, semantic="acquire")
+            val = ld_acquire(full_splits_buf + target_rank * full_splits_buf_expert_stride + expert_idx,
+                             scope=tl.constexpr("sys"))
             ep_rank = expert_idx // experts_per_rank
             expert_idx_intra_rank = expert_idx % experts_per_rank
-            st(
+            st_release(
                 recv_buf_offset_per_expert + ep_rank * experts_per_rank * world_size +
-                expert_idx_intra_rank * world_size + target_rank, val, semantic="release")
-            st(
+                expert_idx_intra_rank * world_size + target_rank, val, scope=tl.constexpr("sys"))
+            st_release(
                 send_buf_offset_per_expert + target_rank * world_size * experts_per_rank +
-                expert_idx_intra_rank * world_size + ep_rank, val, scope="gpu", semantic="release")
+                expert_idx_intra_rank * world_size + ep_rank, val, scope=tl.constexpr("gpu"))
             atomic_add(recv_buf_tokens_per_expert + ep_rank * experts_per_rank + expert_idx_intra_rank, val,
                        scope="gpu", semantic="release")
         __syncthreads()

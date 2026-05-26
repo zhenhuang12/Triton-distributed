@@ -62,11 +62,11 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
         triton_dist_ep_ctx = init_triton_dist_ep_ctx(ep_group, topk, num_experts, ep_implementation="mega")
 
 
-        # TODO: ~105us (v4 Pro 8192)
-        w = (selected_experts.flatten().argsort(stable=True).argsort().int().view(
+        # TODO: ~145us (DSV3, NTOKENS=65536) — 2x rocprim radix sort + inverse permute
+        local_scatter_indices = (selected_experts.flatten().argsort(stable=True).argsort().int().view(
             selected_experts.shape))
 
-        # TODO: ~159us (v4 Pro 8192)
+        # TODO: ~600us (DSV3, NTOKENS=65536) — get_dispatch_send_reqs + bincount + get_ag_splits_and_recv_offset (~530us)
         ep_a2a_layout_desc = triton_dist_ep_ctx.ep_op.preprocess(selected_experts, None, local_scatter_indices)
 
         token_splits_this_rank = ep_a2a_layout_desc.recv_buf_tokens_per_expert[ep_rank]
@@ -76,19 +76,19 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
         profile_config = get_triton_dist_moe_profile_enabled()
 
         if fc1_2 is not None:
-            # TODO: ~2.9ms (v4 Pro 8192)
+            # TODO: ~1.37ms (DSV3, NTOKENS=65536) — CatArrayBatchedCopy on [32, 4096, 7168]
             fc1 = torch.cat([fc1_1, fc1_2], dim=1)
         else:
             fc1 = fc1_1
 
-        # TODO: ~6us (v4 Pro 8192)
+        # TODO: ~38us (DSV3, NTOKENS=65536)
         build_block_row_idx_info_kernel[(optim_config.num_build_sms, )](
             token_splits_this_rank, triton_dist_ep_ctx.split_size_cum_per_expert, triton_dist_ep_ctx.expert_ids,
             triton_dist_ep_ctx.split_size_cum, triton_dist_ep_ctx.tile_num, triton_dist_ep_ctx.tile_num_cum,
             triton_dist_ep_ctx.expert_tile_offset, triton_dist_ep_ctx.num_tiles_total, num_experts_per_rank,
             triton.next_power_of_2(num_experts_per_rank), GROUP_GEMM_BLOCK_SIZE_M, optim_config.num_build_sms)
         
-        # TODO: ~1.3ms (v4 Pro 8192)
+        # TODO: ~14.5ms (DSV3, NTOKENS=65536) — mega_kernel_dispatch_token_moe_grouped_gemm (fwd)
         (
             dispatch_output_local,
             dispatch_weight_in_buf,
@@ -136,11 +136,11 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
 
         triton_dist_ep_ctx.ep_a2a_layout_desc = dispatch_layout_desc
 
-        # TODO: 334us (v4 Pro 8192)
+        # TODO: ~130us (DSV3, NTOKENS=65536) — _swiglu_forward_kernel
         swiglu_output, swiglu_ctx = swiglu_forward(fc1_output, scale=dispatch_weight_in_buf.view(-1))
         triton_dist_ep_ctx.swiglu_ctx = swiglu_ctx
 
-        # TODO: 1.2ms (v4 Pro 8192)
+        # TODO: ~8.0ms (DSV3, NTOKENS=65536) — mega_kernel_moe_grouped_gemm_combine_token (fwd)
         combine_output = triton_dist_ep_ctx.ep_op.mega_group_gemm_combine(
             # group gemm
             gemm_input_data=swiglu_output,
@@ -219,7 +219,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
 
         token_splits_this_rank = ep_a2a_layout_desc.recv_buf_tokens_per_expert[ep_rank]
 
-        # TODO: ~2.7ms (v4 Pro 8192)
+        # TODO: ~14.1ms (DSV3, NTOKENS=65536) — mega_kernel_dispatch_token_moe_grouped_gemm (bwd, weight=fc2)
         (
             dispatch_dy_local,
             dispatch_weight_in_buf,
@@ -265,7 +265,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
         )
         dispatch_dy = dispatch_dy_local
 
-        # TODO: ~15us (v4 Pro 8192)
+        # TODO: ~148us (DSV3, NTOKENS=65536) — _swiglu_backward_kernel
         grad_fc1_output, grad_gate = swiglu_backward(
             grad_swiglu_output,
             fc1_output,
@@ -274,10 +274,10 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
         )
 
         if fc2.requires_grad:
-            # TODO: ~24us (v4 Pro 8192)
+            # TODO: ~125us (DSV3, NTOKENS=65536) — _swiglu_forward_kernel (recompute)
             recompute_swiglu_output, _ = swiglu_forward(fc1_output, scale=dispatch_weight_in_buf.view(-1))
 
-            # TODO: ~1.0ms (v4 Pro 8192)
+            # TODO: ~3.4ms (DSV3, NTOKENS=65536) — transposed_moe_grouped_gemm_kernel_nk_const (grad_fc2)
             grad_fc2 = transposed_moe_grouped_gemm(
                 grad_output=dispatch_dy,
                 original_input=recompute_swiglu_output,
@@ -292,12 +292,12 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
             )
 
         if fc1_2 is not None:
-            # TODO: ~2.9ms (v4 Pro 8192)
+            # TODO: ~1.34ms (DSV3, NTOKENS=65536) — CatArrayBatchedCopy on [32, 4096, 7168]
             fc1 = torch.cat([fc1_1, fc1_2], dim=1)
         else:
             fc1 = fc1_1
 
-        # TODO: ~2.6ms (v4 Pro 8192)
+        # TODO: ~10.7ms (DSV3, NTOKENS=65536) — mega_kernel_moe_grouped_gemm_combine_token (bwd, weight=fc1)
         (
             combine_grad_input,
             combine_grad_gate,
@@ -348,7 +348,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
             profile_file_name="mega_bwd_group_gemm_combine",
         )
 
-        # TODO: ~5.4ms (v4 Pro 8192)
+        # TODO: ~8.5ms (DSV3, NTOKENS=65536) — transposed_moe_grouped_gemm_kernel_nk_const_persistent_dynamic (grad_fc1)
         grad_fc1 = transposed_moe_grouped_gemm(
             grad_output=grad_fc1_output,
             original_input=fwd_dispatch_output,

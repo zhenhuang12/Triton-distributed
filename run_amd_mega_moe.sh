@@ -20,7 +20,7 @@ export ROCSHMEM_HEAP_SIZE=${ROCSHMEM_HEAP_SIZE:-8589934592}  # 8 GiB
 # test (~7.2 GiB required). Same 8 GiB number works for both backends.
 export MORI_SHMEM_HEAP_SIZE=${MORI_SHMEM_HEAP_SIZE:-8589934592}
 export MORI_SHMEM_SYMMETRIC_SIZE=${MORI_SHMEM_SYMMETRIC_SIZE:-8589934592}
-export TRITON_DIST_SHMEM_BACKEND=${TRITON_DIST_SHMEM_BACKEND:-rocshmem}
+export TRITON_DIST_SHMEM_BACKEND=${TRITON_DIST_SHMEM_BACKEND:-mori_shmem}
 # rocSHMEM TCP bootstrap defaults to a 5-second accept window; on a cold
 # torchrun the other ranks can take longer than that just to import torch.
 export ROCSHMEM_BOOTSTRAP_TIMEOUT=${ROCSHMEM_BOOTSTRAP_TIMEOUT:-120}
