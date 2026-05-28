@@ -450,10 +450,10 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                 num_group_gemm_warps=4,
                 num_dispatch_warps=16,
                 num_combine_warps=16,
-                num_dispatch_sms=80,
-                num_tail_sms_in_dispatch=32,
-                num_combine_sms=80,
-                num_reduce_sms_in_combine=80,
+                num_dispatch_sms=32,
+                num_tail_sms_in_dispatch=16,
+                num_combine_sms=32,
+                num_reduce_sms_in_combine=32,
                 dispatch_use_block_wise_barrier=True,
             )
         else:
@@ -477,10 +477,10 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                 num_group_gemm_warps=8,
                 num_dispatch_warps=8,
                 num_combine_warps=8,
-                num_dispatch_sms=64,
+                num_dispatch_sms=32,
                 num_tail_sms_in_dispatch=16,
-                num_combine_sms=64,
-                num_reduce_sms_in_combine=100,
+                num_combine_sms=32,
+                num_reduce_sms_in_combine=32,
                 dispatch_use_block_wise_barrier=True,
             )
         else:

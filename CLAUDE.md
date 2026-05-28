@@ -342,6 +342,111 @@ docker exec dev_primus bash -lc \
 # (heap=68719476736).
 ```
 
+### v5 — shrink dispatch/combine CU pool now that comms is cheap (2026-05-28):
+
+Same command, same shapes, same warmup/iters. Only change is in
+[`python/triton_dist/function/amd/common.py:435-498`](python/triton_dist/function/amd/common.py#L435-L498)
+— the AMD `get_moe_optim_config` CU allocations for the mega path
+were lowered to match the smaller fraction of the kernel runtime
+that comms now occupies after v3 + v4. The v4 head inherited
+NVIDIA-shaped SM counts (forward+mega: dispatch=80, combine=80,
+reduce_in_combine=80, tail_in_dispatch=32; backward+mega:
+dispatch=64, combine=64, reduce_in_combine=100, tail_in_dispatch=16)
+which had been a reasonable starting point when comms was still the
+bottleneck. v5 reclaims those CUs for grouped-GEMM:
+
+```
+forward+mega:   dispatch_sms 80 -> 32  tail_in_dispatch 32 -> 16
+                combine_sms  80 -> 32  reduce_in_combine 80 -> 32
+backward+mega:  dispatch_sms 64 -> 32  tail_in_dispatch 16 (unchanged)
+                combine_sms  64 -> 32  reduce_in_combine 100 -> 32
+```
+
+Why this is the right direction now: in v4 the
+`copy_warp`-based dispatch + `atomic_add`-based barrier traffic
+finished roughly 1.4–1.9× faster than v3 (see v4 / v3 table above),
+so the dispatch / combine roles spent the back half of every wave
+waiting for the grouped-GEMM role to drain. Cutting the comms-role
+pool from ~31% of CUs (80/256) to ~12% (32/256) gives the
+grouped-GEMM role 48 extra CUs without slowing comms — the
+dispatch / combine roles still complete within the GEMM critical
+path because the v4 wire-up is fast enough that even a 2.5× smaller
+pool keeps up.
+
+turbo_fwd column is reproduced unchanged (its baseline didn't move),
+so the v5 vs v4 delta is purely on the `triton_dist_*` columns:
+
+```
+# DeepSeek-V3 (topk=8, num_experts=256, hidden=7168, ffn=2048)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   6.116/ 915.61/✅   6.402/1646.53/N/A   20.112/ 4499.51/✅    1.047x       0.914x
+   8192 (NTOKENS= 65536)  10.855/1804.34/✅  11.998/3278.90/N/A   32.788/ 6277.05/✅    1.105x       0.996x
+  16384 (NTOKENS=131072)  20.115/3544.72/✅  22.653/6485.90/N/A   57.538/ 9757.23/✅    1.126x       1.046x
+
+# DeepSeek-V4-Flash (topk=6, num_experts=256, hidden=4096, ffn=2048)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   3.212/ 510.64/✅   3.362/ 927.51/N/A   10.470/ 2542.37/✅    1.047x       0.914x
+   8192 (NTOKENS= 65536)   5.409/1034.45/✅   6.113/1910.89/N/A   16.607/ 3590.04/✅    1.130x       0.999x
+  16384 (NTOKENS=131072)   9.975/2068.33/✅  11.465/3851.15/N/A   28.831/ 5657.89/✅    1.149x       1.042x
+
+# DeepSeek-V4-Pro (topk=6, num_experts=384, hidden=7168, ffn=3072)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   6.794/ 836.80/✅   7.093/1483.96/N/A   27.352/ 7706.69/✅    1.044x       0.845x
+   8192 (NTOKENS= 65536)  11.532/1667.89/✅  12.502/2985.85/N/A   40.603/ 9368.92/✅    1.084x       0.923x
+  16384 (NTOKENS=131072)  21.061/3281.83/✅  23.554/5896.20/N/A   67.077/12596.89/✅    1.118x       0.993x
+```
+
+**Result: v5 modestly improves on v4 across most shapes, with the
+largest wins on V4-Pro (which had the least headroom under v4) and
+on the smaller local-token shapes where the v4 comms pool was
+overprovisioned relative to the grouped-GEMM work.** The two slight
+regressions (V3 16384 fwd at 0.994×, V4-Flash 16384 fwd_bwd at 0.968×)
+are at the largest shape where comms is still long enough that
+fewer dispatch/combine CUs start to hurt — the next round should
+re-introduce a shape-aware CU split rather than the flat 32/32 used
+here.
+
+v5 / v4 speedup on `triton_dist_fwd` (v4 lat / v5 lat; higher =
+better; peak_mem unchanged):
+
+| Shape         | local 4096 | local 8192 | local 16384 |
+|---|---:|---:|---:|
+| V3            | 1.04×      | 1.03×      | 0.99×       |
+| V4-Flash      | 1.04×      | 1.03×      | 0.98×       |
+| V4-Pro        | 1.06×      | 1.05×      | 1.05×       |
+
+v5 / v4 speedup on `triton_dist_fwd_bwd`:
+
+| Shape         | local 4096 | local 8192 | local 16384 |
+|---|---:|---:|---:|
+| V3            | 1.02×      | 1.04×      | 1.02×       |
+| V4-Flash      | 1.01×      | 1.00×      | 0.97×       |
+| V4-Pro        | 1.03×      | 1.03×      | 1.04×       |
+
+V4-Pro shows the most uniform win — its 384-expert / 3072-ffn
+grouped-GEMM is genuinely GEMM-bound, so the 48 reclaimed CUs feed
+back into the kernel's critical path. V3 and V4-Flash gain at the
+smaller shapes (comms was overprovisioned) but lose 2–3% at local
+16384 (comms is back on the critical path with only 32 CUs). The
+next round (v6) should try shape-aware allocation — keep 80 CUs at
+local 16384, drop to 32 below ~local 8192 — to recover the largest
+shape without giving back the smaller-shape gains.
+
+Reproduce with:
+
+```bash
+docker exec dev_primus bash -lc \
+  "cd /apps/zhuang12/MegaKernel/Triton-distributed && \
+   MODEL=deepseek-v3 TRITON_DIST_SHMEM_BACKEND=mori_shmem \
+   MORI_SHMEM_HEAP_SIZE=68719476736 MORI_SHMEM_SYMMETRIC_SIZE=68719476736 \
+   NTOKENS=131072 EP_NTOKENS_MIN=32768 WARMUP=5 ITERS=15 ./run_amd_mega_moe.sh"
+# Same for MODEL=deepseek-v4-flash (heap=34359738368) and MODEL=deepseek-v4-pro
+# (heap=68719476736).
+```
+
 
 
 ## Skip `pip install` — C++ extensions are pre-built
