@@ -1,0 +1,2 @@
+docker exec dev_primus bash -lc \
+"cd /apps/zhuang12/MegaKernel/Triton-distributed && NTOKENS=65536 EP_NTOKENS_MIN=65536 MODEL=deepseek-v3 TRITON_DIST_SHMEM_BACKEND=mori_shmem MORI_SHMEM_HEAP_SIZE=68719476736 MORI_SHMEM_SYMMETRIC_SIZE=68719476736 WARMUP=5 ITERS=15 ./run_amd_mega_moe.sh"
