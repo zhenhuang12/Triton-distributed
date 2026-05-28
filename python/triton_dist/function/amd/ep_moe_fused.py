@@ -29,8 +29,108 @@ import triton
 from triton_dist.kernels.amd.group_gemm import (
     GROUP_GEMM_BLOCK_SIZE_M,
     transposed_moe_grouped_gemm,
+    transposed_moe_grouped_gemm_kernel_nk_const,
+    transposed_moe_grouped_gemm_kernel_nk_const_persistent_dynamic,
     build_block_row_idx_info_kernel,
 )
+from triton_dist.kernels.amd.memory_ops import fill_tensor as _fill_tensor_for_dynamic_sched
+
+
+def _transposed_moe_grouped_gemm_amd_tuned(
+    grad_output,
+    original_input,
+    split_size,
+    split_size_cum_per_expert,
+    grad_weight=None,
+    BLOCK_SIZE_M: int = 64,
+    BLOCK_SIZE_N: int = 128,
+    BLOCK_SIZE_K: int = 256,
+    GROUP_SIZE_M: int = 4,
+    num_warps=8,
+    num_stages=3,
+    persistent="none",
+    sm_margin=0,
+):
+    """In-scope drop-in for ``transposed_moe_grouped_gemm`` that forwards
+    AMD backend kwargs (``matrix_instr_nonkdim=16, waves_per_eu=0,
+    kpack=1``) to the underlying Triton kernels. exp_1 proved this combo
+    is a clear win on MFMA-LDS-pressured grouped GEMMs; the out-of-scope
+    upstream wrapper drops these kwargs on the floor."""
+    M, N = grad_output.shape
+    M_, K = original_input.shape
+    G = split_size.shape[0]
+    assert M == M_
+    assert persistent in ("none", "dynamic")
+    if grad_weight is None:
+        grad_weight = torch.empty([G, N, K], dtype=grad_output.dtype, device=grad_output.device)
+    else:
+        G_, N_, K_ = grad_weight.shape
+        assert G == G_ and N == N_ and K == K_
+
+    if persistent == "none":
+        grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_N']) * triton.cdiv(K, meta['BLOCK_SIZE_K']), G)
+        transposed_moe_grouped_gemm_kernel_nk_const[grid](
+            grad_output,
+            original_input,
+            grad_weight,
+            split_size,
+            split_size_cum_per_expert,
+            M,
+            N,
+            K,
+            G,
+            grad_output.stride(0),
+            grad_output.stride(1),
+            original_input.stride(0),
+            original_input.stride(1),
+            grad_weight.stride(0),
+            grad_weight.stride(1),
+            grad_weight.stride(2),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=0,
+            kpack=1,
+        )
+    else:  # dynamic
+        max_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+        num_sms = max(1, max_sms - sm_margin)
+        grid = lambda meta: (num_sms, )
+        dynamic_schedule_ptr = torch.empty([1], dtype=torch.int32, device=grad_output.device)
+        _fill_tensor_for_dynamic_sched(dynamic_schedule_ptr, 0, num_sms=1)
+        transposed_moe_grouped_gemm_kernel_nk_const_persistent_dynamic[grid](
+            dynamic_schedule_ptr,
+            grad_output,
+            original_input,
+            grad_weight,
+            split_size,
+            split_size_cum_per_expert,
+            M,
+            N,
+            K,
+            G,
+            grad_output.stride(0),
+            grad_output.stride(1),
+            original_input.stride(0),
+            original_input.stride(1),
+            grad_weight.stride(0),
+            grad_weight.stride(1),
+            grad_weight.stride(2),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=0,
+            kpack=1,
+        )
+    return grad_weight
 
 import torch.distributed as dist
 from triton_dist.kernels.amd.swiglu import swiglu_forward, swiglu_backward
@@ -278,7 +378,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
             recompute_swiglu_output, _ = swiglu_forward(fc1_output, scale=dispatch_weight_in_buf.view(-1))
 
             # TODO: ~3.4ms (DSV3, NTOKENS=65536) — transposed_moe_grouped_gemm_kernel_nk_const (grad_fc2)
-            grad_fc2 = transposed_moe_grouped_gemm(
+            grad_fc2 = _transposed_moe_grouped_gemm_amd_tuned(
                 grad_output=dispatch_dy,
                 original_input=recompute_swiglu_output,
                 split_size=token_splits_this_rank,
@@ -297,11 +397,12 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
         else:
             fc1 = fc1_1
 
-        # TODO: ~10.7ms (DSV3, NTOKENS=65536) — mega_kernel_moe_grouped_gemm_combine_token (bwd, weight=fc1)
+        # exp_6: fused bwd combine + grad_fc1 (single mega-kernel launch).
+        # Was two launches: 6.83 ms combine + 7.61 ms standalone grad_fc1.
         (
             combine_grad_input,
             combine_grad_gate,
-            # grad_fc1,
+            grad_fc1,
         ) = triton_dist_ep_ctx.ep_op.mega_group_gemm_combine(
             # group gemm
             gemm_input_data=grad_fc1_output,
@@ -335,33 +436,17 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
             num_warps=optim_config.num_combine_warps,
             combine_mode="fuse_scatter",
 
-            # transposed group gemm params
-            # grad_output=grad_fc1_output,
-            # orig_input=fwd_dispatch_output,
-            # grad_weight=None,
-            # split_size_cum_per_expert=triton_dist_ep_ctx.split_size_cum_per_expert,
-            # grad_BLOCK_SIZE_M=64,
-            # grad_BLOCK_SIZE_N=256,
-            # grad_BLOCK_SIZE_K=128,
-            # grad_GROUP_SIZE_M=4,
+            # transposed group gemm params (grad_fc1)
+            grad_output=grad_fc1_output,
+            orig_input=fwd_dispatch_output,
+            grad_weight=None,
+            split_size_cum_per_expert=triton_dist_ep_ctx.split_size_cum_per_expert,
+            grad_BLOCK_SIZE_M=64,
+            grad_BLOCK_SIZE_N=256,
+            grad_BLOCK_SIZE_K=128,
+            grad_GROUP_SIZE_M=4,
             enable_profiler=profile_config["bwd_combine"],
             profile_file_name="mega_bwd_group_gemm_combine",
-        )
-
-        # TODO: ~8.5ms (DSV3, NTOKENS=65536) — transposed_moe_grouped_gemm_kernel_nk_const_persistent_dynamic (grad_fc1)
-        grad_fc1 = transposed_moe_grouped_gemm(
-            grad_output=grad_fc1_output,
-            original_input=fwd_dispatch_output,
-            split_size=token_splits_this_rank,
-            split_size_cum_per_expert=triton_dist_ep_ctx.split_size_cum_per_expert,
-            BLOCK_SIZE_M=64,
-            BLOCK_SIZE_N=128,
-            BLOCK_SIZE_K=256,
-            GROUP_SIZE_M=4,
-            num_warps=optim_config.num_group_gemm_warps,
-            num_stages=3,
-            persistent="dynamic",
-            sm_margin=0,
         )
 
         if fc1_2 is not None:

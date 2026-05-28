@@ -517,9 +517,15 @@ def main():
                     output.backward(grad_output)
                     return output
 
+                def turbo_fwd_bwd():
+                    output = turbo_ep_moe(weights, activations, turbo_dispatcher)
+                    output.backward(grad_output)
+                    return output
+
                 # Benchmark
                 triton_dist_fwd_time, triton_dist_fwd_mem = (0.0, 0.0)
                 triton_dist_fwd_bwd_time, triton_dist_fwd_bwd_mem = (0.0, 0.0)
+                turbo_fwd_bwd_time, turbo_fwd_bwd_mem = (0.0, 0.0)
 
                 triton_dist_fwd_time, triton_dist_fwd_mem = benchmark_latency_memory(
                     triton_dist_fwd, args.iters, args.warmup)
@@ -530,6 +536,9 @@ def main():
                 with torch.no_grad():
                     turbo_fwd_time, turbo_fwd_mem = benchmark_latency_memory(
                         turbo_fwd, args.iters, args.warmup)
+                if not args.skip_backward:
+                    turbo_fwd_bwd_time, turbo_fwd_bwd_mem = benchmark_latency_memory(
+                        turbo_fwd_bwd, args.iters, args.warmup, pre_func=zero_grads)
 
                 # Precision check: use the same inputs for both implementations
                 # Prepare reference inputs once and clone for both implementations
@@ -587,6 +596,9 @@ def main():
                 implementations['turbo_fwd'] = {
                     'latency': turbo_fwd_time, 'memory': turbo_fwd_mem, 'precision': 'N/A'
                 }
+                implementations['turbo_fwd_bwd'] = {
+                    'latency': turbo_fwd_bwd_time, 'memory': turbo_fwd_bwd_mem, 'precision': 'N/A'
+                }
 
                 config_key = (ntokens, hidden_dim, ffn_dim)
                 all_implementations[config_key] = implementations
@@ -622,20 +634,23 @@ def main():
             all_implementations, "Expert Parallel MoE", param_names=['Ntokens', 'Hidden', 'FFN'],
             title_params={'SM_margin': args.sm_margin, 'topk': args.topk, 'num_experts': args.num_experts})
 
-        # Perf table: triton_dist throughput as a fraction of turbo_fwd
-        # (turbo_lat / triton_dist_lat — lower latency is better, so <1.0x
-        # means triton_dist is slower than turbo; e.g. 0.50x = half the perf).
+        # Perf table: triton_dist throughput as a fraction of the matching
+        # turbo baseline (turbo_lat / triton_dist_lat — lower latency is
+        # better, so <1.0x means triton_dist is slower than turbo;
+        # e.g. 0.50x = half the perf). fwd_perf uses turbo_fwd; fwd_bwd_perf
+        # uses turbo_fwd_bwd so both columns are apples-to-apples.
         print()
-        print("Perf vs turbo_fwd baseline (turbo_lat / triton_dist_lat; <1.0x = slower than turbo)")
+        print("Perf vs turbo baseline (turbo_lat / triton_dist_lat; <1.0x = slower than turbo)")
         print(f"{'Ntokens':>8} {'Hidden':>8} {'FFN':>8} {'fwd_perf':>12} {'fwd_bwd_perf':>14}")
         print("=" * 56)
         for config_key, impls in all_implementations.items():
             ntokens_v, hidden_v, ffn_v = config_key
-            turbo_lat = impls.get('turbo_fwd', {}).get('latency')
+            turbo_fwd_lat = impls.get('turbo_fwd', {}).get('latency')
+            turbo_fb_lat = impls.get('turbo_fwd_bwd', {}).get('latency')
             td_fwd_lat = impls.get('triton_dist_fwd', {}).get('latency')
             td_fb_lat = impls.get('triton_dist_fwd_bwd', {}).get('latency')
-            fwd_p = f"{turbo_lat / td_fwd_lat:.3f}x" if turbo_lat and td_fwd_lat else "N/A"
-            fb_p = f"{turbo_lat / td_fb_lat:.3f}x" if turbo_lat and td_fb_lat else "N/A"
+            fwd_p = f"{turbo_fwd_lat / td_fwd_lat:.3f}x" if turbo_fwd_lat and td_fwd_lat else "N/A"
+            fb_p = f"{turbo_fb_lat / td_fb_lat:.3f}x" if turbo_fb_lat and td_fb_lat else "N/A"
             print(f"{ntokens_v:>8} {hidden_v:>8} {ffn_v:>8} {fwd_p:>12} {fb_p:>14}")
 
     if args.enable_kernel_profiler:

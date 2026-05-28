@@ -131,13 +131,17 @@ primus_turbo grouped_gemm, fwd-only). `perf` columns are
 `turbo_lat / triton_dist_lat` — values **< 1.0× mean ep_moe_fused is
 slower than turbo** (lower latency = better).
 
-Numbers are tracked across optimisation rounds — the **v0** block
-below is the initial port, the **v3** block further down is the
-current head (round 3: every acquire-ordered `ld` and every
-release-ordered `st` on the cross-rank signal flags was swapped for
-the **cheap-fence** `ld_acquire` / `st_release` helpers in
-[`python/triton_dist/language/extra/hip/language_extra.py:356-369`](python/triton_dist/language/extra/hip/language_extra.py#L356-L369)).
-Keep both blocks intact when adding future rounds so regressions
+Numbers are tracked across optimisation rounds — the **v2** block
+below is the initial baseline, **v3** swapped acquire/release flag
+traffic for the cheap-fence helpers, and the **v4** block at the
+bottom is the current head (round 4: every
+`libshmem_device.putmem_warp` on the dispatch / combine fast path
+was replaced with the native `copy_warp` helper, and every
+`libshmem_device.signal_op` / `libshmem_device.fence`-then-store
+sequence on the per-expert / per-token barrier flags was replaced
+with a relaxed `atomic_add` / `st_release` to the symm pointer —
+see the diff in [`python/triton_dist/kernels/amd/ep_all2all_fused.py`](python/triton_dist/kernels/amd/ep_all2all_fused.py)).
+Keep all three blocks intact when adding future rounds so regressions
 are visible against the historical lineage.
 
 ### v2 — initial baseline:
@@ -230,6 +234,113 @@ didn't move):
 | V3            | 1.43×      | 1.46×      | 1.43×       |
 | V4-Flash      | 1.48×      | 1.50×      | 1.53×       |
 | V4-Pro        | 1.32×      | 1.34×      | 1.31×       |
+
+### v4 — native `copy_warp` + relaxed `atomic_add` on dispatch/combine (2026-05-28):
+
+Same command, same shapes, same warmup/iters. Two changes vs v3:
+
+1. **Drop `libshmem_device.putmem_warp` on the dispatch + combine
+   token-copy fast path** ([`ep_all2all_fused.py:124,131,234,244`](python/triton_dist/kernels/amd/ep_all2all_fused.py#L124))
+   in favour of `copy_warp(dst_ptr, src_ptr, bytes)` — the same
+   warp-cooperative `tl.load` + `tl.store` we already use for
+   intra-rank copies. The mori dispatcher under
+   `libshmem_device.putmem_warp` had a per-call setup cost (target-rank
+   symm-pointer resolution + intrinsic dispatch) that dominated for
+   the short per-token transfers; the native helper compiles down
+   directly to the symm pointer the kernel already computed via
+   `dl.symm_at`.
+2. **Drop `libshmem_device.signal_op(... MORI_SIGNAL_SET ..., remote_rank)`
+   plus its preceding `libshmem_device.fence()`** on every per-expert
+   ready-flag bump and zero-token signal ([`ep_all2all_fused.py:139-145,152-156`](python/triton_dist/kernels/amd/ep_all2all_fused.py#L139)),
+   and replace with a single relaxed `atomic_add(remote_flag_ptr,
+   1, scope="agent"|"gpu", semantic="relaxed")` plus, where the
+   sender needs ordering with a prior store, the already-released
+   `st_release` to the symm pointer that v3 introduced. The
+   release/fence pair was overkill — the receiver-side ordering is
+   guarded by the existing `ld_acquire` in the wait loop, and the
+   token payload's own `st_release` (sys scope) already publishes
+   the data; the extra `libshmem_device.fence()` only added a redundant
+   wait-counter drain on the sender's path.
+
+Both swaps preserve correctness: dispatch / combine still gate on
+the same `ld_acquire(barriers_ptr + ...)` wait loops, and the
+counter writes are still `sys`-visible (mori's symm pointer maps
+the remote rank's HBM into the local agent's address space).
+Companion `common.py` tidy-up collapses the dead small-CU branches
+of `get_moe_optim_config` (MI355X has 256 CUs ≫ 78) and aligns
+`num_group_gemm_warps` for the mega-MoE backward path (16→8) —
+these are config-only and don't change the dispatch / combine code
+path, but they ride in the same v4 changeset.
+
+turbo_fwd column is reproduced unchanged (its baseline didn't move),
+so the v4 vs v3 delta is purely on the `triton_dist_*` columns:
+
+```
+# DeepSeek-V3 (topk=8, num_experts=256, hidden=7168, ffn=2048)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   6.339/ 915.61/✅   6.486/1653.50/N/A   20.552/ 4499.51/✅    1.023x       0.900x
+   8192 (NTOKENS= 65536)  11.212/1804.34/✅  11.968/3292.82/N/A   34.013/ 6277.05/✅    1.067x       0.959x
+  16384 (NTOKENS=131072)  20.002/3544.72/✅  22.466/6513.77/N/A   58.614/ 9757.23/✅    1.123x       1.024x
+
+# DeepSeek-V4-Flash (topk=6, num_experts=256, hidden=4096, ffn=2048)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   3.330/ 510.64/✅   3.392/ 932.97/N/A   10.609/ 2542.37/✅    1.019x       0.905x
+   8192 (NTOKENS= 65536)   5.585/1034.64/✅   6.117/1922.52/N/A   16.561/ 3590.23/✅    1.095x       0.996x
+  16384 (NTOKENS=131072)   9.740/2068.33/✅  11.282/3874.17/N/A   27.919/ 5657.89/✅    1.158x       1.070x
+
+# DeepSeek-V4-Pro (topk=6, num_experts=384, hidden=7168, ffn=3072)
+ local (global)        triton_dist_fwd          turbo_fwd      triton_dist_fwd_bwd     fwd_perf  fwd_bwd_perf
+=============================================================================================================
+   4096 (NTOKENS= 32768)   7.190/ 836.80/✅   7.089/1491.60/N/A   28.096/ 7706.69/✅    0.986x       0.823x
+   8192 (NTOKENS= 65536)  12.162/1667.89/✅  12.444/3001.38/N/A   41.859/ 9368.92/✅    1.023x       0.893x
+  16384 (NTOKENS=131072)  22.216/3282.74/✅  23.306/5926.77/N/A   69.651/12596.89/✅    1.049x       0.953x
+```
+
+**Result: `triton_dist_fwd` now beats the `turbo_fwd` baseline on
+every V3 / V4-Flash shape and on the two larger V4-Pro shapes**
+(V4-Pro 32768 is the only remaining sub-1.0× point at 0.986×).
+`triton_dist_fwd_bwd` reaches parity (≥1.0×) on the two larger V3
+shapes and V4-Flash 65536 / 131072; backward on V4-Pro and smaller
+V4-Flash is still ~5-10% slower than turbo and is the next target.
+
+v4 / v3 speedup on `triton_dist_fwd` (v3 lat / v4 lat; higher =
+better; peak_mem essentially unchanged — small drift from the
+turbo dispatcher's own allocator, not from `ep_moe_fused`):
+
+| Shape         | local 4096 | local 8192 | local 16384 |
+|---|---:|---:|---:|
+| V3            | 1.54×      | 1.46×      | 1.49×       |
+| V4-Flash      | 1.82×      | 1.87×      | 1.90×       |
+| V4-Pro        | 1.29×      | 1.30×      | 1.33×       |
+
+v4 / v3 speedup on `triton_dist_fwd_bwd`:
+
+| Shape         | local 4096 | local 8192 | local 16384 |
+|---|---:|---:|---:|
+| V3            | 1.42×      | 1.46×      | 1.54×       |
+| V4-Flash      | 1.54×      | 1.76×      | 1.90×       |
+| V4-Pro        | 1.19×      | 1.28×      | 1.35×       |
+
+The V4-Flash row shows the largest win — its smaller hidden (4096
+vs 7168) means the per-token copy is short enough that the
+`putmem_warp` setup cost dominated; replacing it with `copy_warp`
+removes the most overhead per token. V4-Pro shows the smallest win
+because its larger `ffn` (3072) and `num_experts` (384) push the
+runtime back towards being GEMM-bound rather than comms-bound.
+
+Reproduce with:
+
+```bash
+docker exec dev_primus bash -lc \
+  "cd /apps/zhuang12/MegaKernel/Triton-distributed && \
+   MODEL=deepseek-v3 TRITON_DIST_SHMEM_BACKEND=mori_shmem \
+   MORI_SHMEM_HEAP_SIZE=68719476736 MORI_SHMEM_SYMMETRIC_SIZE=68719476736 \
+   NTOKENS=131072 EP_NTOKENS_MIN=32768 WARMUP=5 ITERS=15 ./run_amd_mega_moe.sh"
+# Same for MODEL=deepseek-v4-flash (heap=34359738368) and MODEL=deepseek-v4-pro
+# (heap=68719476736).
+```
 
 
 

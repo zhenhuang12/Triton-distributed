@@ -443,39 +443,24 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
     """
     max_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     if is_forward:
-        if max_sms > 78:  # MI300X / MI355X / MI325X all expose > 78 CUs
-            if use_mega:
-                return MoEOptimConfig(
-                    num_build_sms=8,
-                    num_copy_sms=max_sms,
-                    num_group_gemm_warps=4,
-                    num_dispatch_warps=16,
-                    num_combine_warps=16,
-                    num_dispatch_sms=80,
-                    num_tail_sms_in_dispatch=32,
-                    num_combine_sms=80,
-                    num_reduce_sms_in_combine=80,
-                    dispatch_use_block_wise_barrier=True,
-                )
-            else:
-                return MoEOptimConfig(
-                    num_build_sms=8,
-                    num_copy_sms=max_sms,
-                    num_group_gemm_warps=4,
-                    num_dispatch_warps=16,
-                    num_combine_warps=16,
-                    num_dispatch_sms=64,
-                    num_tail_sms_in_dispatch=0,
-                    num_combine_sms=64,
-                    num_reduce_sms_in_combine=0,
-                    dispatch_use_block_wise_barrier=False,
-                )
-        else:
-            print("Warning: small-CU AMD config is not tuned for forward.")
+        if use_mega:
             return MoEOptimConfig(
                 num_build_sms=8,
-                num_copy_sms=32,
-                num_group_gemm_warps=16,
+                num_copy_sms=max_sms,
+                num_group_gemm_warps=4,
+                num_dispatch_warps=16,
+                num_combine_warps=16,
+                num_dispatch_sms=80,
+                num_tail_sms_in_dispatch=32,
+                num_combine_sms=80,
+                num_reduce_sms_in_combine=80,
+                dispatch_use_block_wise_barrier=True,
+            )
+        else:
+            return MoEOptimConfig(
+                num_build_sms=8,
+                num_copy_sms=max_sms,
+                num_group_gemm_warps=4,
                 num_dispatch_warps=16,
                 num_combine_warps=16,
                 num_dispatch_sms=64,
@@ -485,39 +470,24 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                 dispatch_use_block_wise_barrier=False,
             )
     else:  # backward
-        if max_sms > 78:
-            if use_mega:
-                return MoEOptimConfig(
-                    num_build_sms=8,
-                    num_copy_sms=max_sms,
-                    num_group_gemm_warps=4,
-                    num_dispatch_warps=8,
-                    num_combine_warps=16,
-                    num_dispatch_sms=64,
-                    num_tail_sms_in_dispatch=16,
-                    num_combine_sms=64,
-                    num_reduce_sms_in_combine=100,
-                    dispatch_use_block_wise_barrier=True,
-                )
-            else:
-                return MoEOptimConfig(
-                    num_build_sms=8,
-                    num_copy_sms=max_sms,
-                    num_group_gemm_warps=4,
-                    num_dispatch_warps=16,
-                    num_combine_warps=16,
-                    num_dispatch_sms=64,
-                    num_tail_sms_in_dispatch=0,
-                    num_combine_sms=64,
-                    num_reduce_sms_in_combine=0,
-                    dispatch_use_block_wise_barrier=False,
-                )
-        else:
-            print("Warning: small-CU AMD config is not tuned for backward.")
+        if use_mega:
             return MoEOptimConfig(
                 num_build_sms=8,
-                num_copy_sms=32,
-                num_group_gemm_warps=16,
+                num_copy_sms=max_sms,
+                num_group_gemm_warps=8,
+                num_dispatch_warps=8,
+                num_combine_warps=8,
+                num_dispatch_sms=64,
+                num_tail_sms_in_dispatch=16,
+                num_combine_sms=64,
+                num_reduce_sms_in_combine=100,
+                dispatch_use_block_wise_barrier=True,
+            )
+        else:
+            return MoEOptimConfig(
+                num_build_sms=8,
+                num_copy_sms=max_sms,
+                num_group_gemm_warps=4,
                 num_dispatch_warps=16,
                 num_combine_warps=16,
                 num_dispatch_sms=64,

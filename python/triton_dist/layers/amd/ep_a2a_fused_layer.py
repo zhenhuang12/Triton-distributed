@@ -483,7 +483,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
             s1 = slice(0, M_recv * self.topk * self.local_world_size)
         else:
             s1 = slice(None)
-        self.mega_combine_counter_buf[s1].fill_(0)
+        fill_tensor(self.mega_combine_counter_buf[s1], 0, self.MAX_SMS)
         self.mega_combine_barrier_buf[s1].fill_(0)
         self.mega_combine_scatter_output_barrier_buf.fill_(-1)
         self.intra_node_dispatch_skipped_token_mapping_indices.fill_(-1)
@@ -737,6 +737,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
             NUM_TAIL_SMS=num_tail_sms,
             num_warps=num_warps,
             num_stages=gemm_num_stages,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=0,
+            kpack=1,
             profiler_buffer=profiler_buffer,
             ENABLE_PROFILING=enable_profiler,
         )
@@ -838,12 +841,10 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
         assert M <= self.max_tokens, f"M ({M}) must be <= self.max_tokens ({self.max_tokens})"
         # need to clear this buffer due to final reduce sum
-        # fill_tensor(self.combine_out_buf.view(self.max_tokens, self.hidden)[:M, :], 0, MEGA_SMS)
-        self.combine_out_buf.view(self.max_tokens, self.hidden)[:M, :].zero_()
+        fill_tensor(self.combine_out_buf.view(self.max_tokens, self.hidden)[:M, :], 0, MEGA_SMS)
         if combine_mode == "fuse_scatter":
             # need to clear this buffer due to drop token
-            # fill_tensor(self.mega_combine_scatter_output_buf[:M * self.topk], 0, MEGA_SMS)
-            self.mega_combine_scatter_output_buf[:M * self.topk].zero_()
+            fill_tensor(self.mega_combine_scatter_output_buf[:M * self.topk], 0, MEGA_SMS)
         has_gate = gate_input is not None
         if has_gate:
             fill_tensor(
@@ -969,6 +970,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 # num_warps=(num_scatter_warps + num_reduce_warps),
                 num_warps=num_warps,
                 num_stages=gemm_num_stages,
+                matrix_instr_nonkdim=16,
+                waves_per_eu=0,
+                kpack=1,
             )
         else:  # with transposed group gemm
             mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm[grid](
@@ -1049,6 +1053,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 ENABLE_PROFILING=enable_profiler,
                 num_warps=num_warps,
                 num_stages=gemm_num_stages,
+                matrix_instr_nonkdim=16,
+                waves_per_eu=0,
+                kpack=1,
             )
 
         torch.cuda.current_stream().synchronize()

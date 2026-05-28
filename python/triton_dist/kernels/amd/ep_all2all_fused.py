@@ -121,25 +121,24 @@ def tile_kernel_dispatch_token_intra_node(
             src_ptr = input_buf + token_offset * hidden_size
             dst_ptr = output_buf + store_idx.to(tl.int64) * hidden_size
 
-            libshmem_device.putmem_warp(dst_ptr, src_ptr, bytes_per_token, expert_rank)
+            copy_warp(dst_ptr, src_ptr, bytes_per_token)
 
             if not WITH_SCATTER_INDICES:
                 st(token_dst_scatter_idx + sort_token_offset, store_idx)
 
             if HAS_WEIGHT:
-                libshmem_device.putmem_warp(weight_recv_buf + store_idx, weight_send_buf + sort_token_offset,
-                                            weight_elem_size, expert_rank)
+                copy_warp(weight_recv_buf + store_idx, weight_send_buf + sort_token_offset,
+                          weight_elem_size)
             sync_warp()
             if lane_idx == 0:
                 tokens_this_expert = ld(local_splits_buf + expert_idx)
                 sent_tokens = atomic_add(counter_ptr + expert_idx, 1, scope="gpu", semantic="relaxed")
                 if sent_tokens == tokens_this_expert - 1:
-                    libshmem_device.fence()
-                    libshmem_device.signal_op(
+                    atomic_add(
                         barriers_ptr + expert_idx_intra_rank * world_size + rank,
                         1,
-                        libshmem_device.MORI_SIGNAL_SET,
-                        expert_rank,
+                        scope="agent",
+                        semantic="relaxed",
                     )
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=0)
@@ -148,11 +147,11 @@ def tile_kernel_dispatch_token_intra_node(
         for i in range(thread_idx, experts_per_rank * world_size, num_warps * WARP_SIZE):
             tokens_this_expert = ld(local_splits_buf + i)
             if tokens_this_expert == 0:
-                libshmem_device.signal_op(
+                atomic_add(
                     barriers_ptr + i // experts_per_rank * world_size + rank,
                     1,
-                    libshmem_device.MORI_SIGNAL_SET,
-                    i // experts_per_rank,
+                    scope="gpu",
+                    semantic="relaxed",
                 )
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=1)
@@ -232,8 +231,8 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                     st(token_dst_scatter_idx + sort_token_offset, store_idx)
 
                 if HAS_WEIGHT:
-                    libshmem_device.putmem_warp(weight_recv_buf + store_idx, weight_send_buf + sort_token_offset,
-                                                weight_elem_size, expert_rank)
+                    copy_warp(weight_recv_buf + store_idx, weight_send_buf + sort_token_offset,
+                              weight_elem_size)
 
                 src_ptr = input_buf + token_offset * hidden_size
                 dst_ptr = output_buf + store_idx.to(tl.int64) * hidden_size
@@ -242,11 +241,10 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                 remote_token_indirect_pos = dl.symm_at(token_indirect_pos_buf, expert_rank)
                 if has_sent < 0:
                     has_sent = store_idx
-                    libshmem_device.putmem_warp(dst_ptr, src_ptr, bytes_per_token, expert_rank)
+                    copy_warp(dst_ptr, src_ptr, bytes_per_token)
                     st(token_rank_table_buf + token_offset * world_size + expert_rank, store_idx)
                 sync_warp()
                 if lane_idx == 0:
-                    libshmem_device.fence()
                     st_release(remote_token_indirect_pos + store_idx, has_sent, scope=tl.constexpr("sys"))
 
     if ENABLE_PROFILING:
@@ -471,7 +469,6 @@ def tile_kernel_scatter_token_intra_node(
         if scatter_output_barrier_buf is not None:
             sync_warp()
             if lane_idx == 0:
-                libshmem_device.fence()
                 st_release(remote_scatter_output_barrier_buf + input_token_idx, 1, scope=tl.constexpr("sys"))
 
     if ENABLE_PROFILING:
@@ -1714,7 +1711,6 @@ def kernel_get_ag_splits_and_recv_offset(
                     index_elem_size * max_tokens * topk,
                     target_rank,
                 )
-            libshmem_device.fence()
             libshmem_device.putmem_signal_nbi_block(
                 indices_ptr,
                 indices_ptr,
