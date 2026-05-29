@@ -336,6 +336,19 @@ def _memory_barrier(_semantic=None):
 
 
 @core.extern
+def memory_fence(scope: core.constexpr = core.constexpr("gpu"), _semantic=None):
+    return core.inline_asm_elementwise(
+        asm="s_waitcnt lgkmcnt(0) vmcnt(0)",
+        constraints="=r,~{memory}",
+        args=[],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
 def _compiler_barrier(_semantic=None):
     # Empty asm with ~{memory} clobber == __atomic_signal_fence(SEQ_CST):
     # no instructions emitted, just forbids LLVM from reordering memory ops

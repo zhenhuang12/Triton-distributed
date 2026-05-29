@@ -46,8 +46,6 @@ from triton_dist.utils import (
     mori_shmem_barrier_all_on_stream,
     rocshmem_barrier_all_on_stream,
     MORI_SHMEM_SIGNAL_DTYPE,
-    mori_shmem_create_tensor,
-    mori_shmem_free_tensor_sync,
     supports_p2p_native_atomic,
     get_triton_dist_world,
     get_triton_dist_local_world_size,
@@ -112,6 +110,27 @@ def load_envreg(val: tl.constexpr):
         args=[],
         dtype=(tl.uint32),
         is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def s_sleep(cycles: tl.constexpr):
+    """Emit AMDGCN ``s_sleep`` as a back-off inside a busy-wait spin loop.
+
+    ``s_sleep N`` idles the wavefront for roughly ``N * 64`` clocks (``N`` in
+    0..127), yielding issue slots to sibling waves instead of hammering the
+    L2/XGMI path with back-to-back polling ``ld_acquire``\\ s.  The operand must
+    be a compile-time immediate, so it is baked into the asm string;
+    ``is_pure=False`` keeps it from being hoisted out of the loop or removed by
+    DCE (the ``$0`` output is a discarded dummy).
+    """
+    tl.inline_asm_elementwise(
+        asm=f"s_sleep {cycles}\nv_mov_b32 $0, 0",
+        constraints="=v",
+        args=[],
+        dtype=tl.int32,
+        is_pure=False,
         pack=1,
     )
 
@@ -283,11 +302,8 @@ class BarrierAllContext:
             # about, but ``local_rank = rank % local_world_size`` keeps us
             # correct under non-uniform rank ordering.
             self.rank = get_triton_dist_world().rank()
-            self.local_world_size = (
-                get_triton_dist_local_world_size()
-                or int(_os.environ.get("LOCAL_WORLD_SIZE", "0"))
-                or int(_os.environ.get("WORLD_SIZE", "1"))
-            )
+            self.local_world_size = (get_triton_dist_local_world_size() or int(_os.environ.get("LOCAL_WORLD_SIZE", "0"))
+                                     or int(_os.environ.get("WORLD_SIZE", "1")))
             self.local_rank = self.rank % self.local_world_size
             self.num_local_ranks = self.local_world_size
             self.symm_barrier = shmem_create_tensor((self.num_local_ranks, ), torch.int32)
@@ -299,8 +315,7 @@ class BarrierAllContext:
             self._shmem_free_tensor_sync(self.symm_barrier)
 
 
-def barrier_all_on_stream(stream: Optional[torch.cuda.Stream] = None, *,
-                          ctx: Optional["BarrierAllContext"] = None):
+def barrier_all_on_stream(stream: Optional[torch.cuda.Stream] = None, *, ctx: Optional["BarrierAllContext"] = None):
     """
     NVIDIA-style barrier on stream.
 

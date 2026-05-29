@@ -160,31 +160,32 @@ breakdown of work inside each mega kernel, not for absolute timing:
 ```
 ================ in-kernel profiler summary (ns / record) ================
 kernel                                           task                                  n       mean        p50        p99        max   share
-mega_bwd_dispatch_group_gemm_rank_0              group_gemm_wait                  229096     847760         36   23948587   71552324   83.1%
-mega_bwd_dispatch_group_gemm_rank_0              dispatch_token_tail_notify         6912    4879344          8   63098702   71970220   14.4%
-mega_bwd_dispatch_group_gemm_rank_0              group_gemm_main                  229096      17599      17644      20164      22624    1.7%
-mega_bwd_dispatch_group_gemm_rank_0              dispatch_token_main                6912     267263     297968     419513     425832    0.8%
-mega_bwd_dispatch_group_gemm_rank_0              group_gemm_preprocess            229096          5          4          8          8    0.0%
+mega_bwd_dispatch_group_gemm_rank_0              group_gemm_wait                  229096     926159         92   21140665  100739084   85.7%
+mega_bwd_dispatch_group_gemm_rank_0              dispatch_token_tail_notify         6912    4447013         32   68297608  100981804   12.4%
+mega_bwd_dispatch_group_gemm_rank_0              group_gemm_main                  229096      16101      15256      18508     972841    1.5%
+mega_bwd_dispatch_group_gemm_rank_0              dispatch_token_main                6912     127880     161004     229149     260700    0.4%
+mega_bwd_dispatch_group_gemm_rank_0              group_gemm_preprocess            229096          9          8         12        144    0.0%
 ------------------------------------------------------------------------------------------------------------------------
-mega_bwd_group_gemm_combine_rank_0               group_gemm_main                  801836      10545       9456      19428      27392   69.4%
-mega_bwd_group_gemm_combine_rank_0               combine_scatter_token              3456     880722     883586     907908     911848   25.0%
-mega_bwd_group_gemm_combine_rank_0               group_gemm_tail_notify           801836        493        428       1908       5464    3.2%
-mega_bwd_group_gemm_combine_rank_0               combine_topk_reduce                5400      51300      23468    1412946    1536300    2.3%
-mega_bwd_group_gemm_combine_rank_0               group_gemm_preprocess            801836          6          8          8        156    0.0%
+mega_bwd_group_gemm_combine_rank_0               transposed_group_gemm_main       1548288       6467       6268       7248    1227314   33.5%
+mega_bwd_group_gemm_combine_rank_0               combine_topk_reduce                6912     978630      31760   51147114   51341396   22.6%
+mega_bwd_group_gemm_combine_rank_0               combine_scatter_token              6912     962244     956072    1098574    1110800   22.2%
+mega_bwd_group_gemm_combine_rank_0               group_gemm_main                  801836       7551       7348       9948     105698   20.2%
+mega_bwd_group_gemm_combine_rank_0               group_gemm_tail_notify           801836        513        520        796      96839    1.4%
+mega_bwd_group_gemm_combine_rank_0               transposed_group_gemm_preprocess 1548288          5          4         12        192    0.0%
+mega_bwd_group_gemm_combine_rank_0               group_gemm_preprocess            801836          5          4          8        260    0.0%
 ------------------------------------------------------------------------------------------------------------------------
-mega_dispatch_group_gemm_rank_0                  group_gemm_main                  899568      14706      14956      16900      19272   70.3%
-mega_dispatch_group_gemm_rank_0                  dispatch_token_main               13568     234824     237640     287709     298532   16.9%
-mega_dispatch_group_gemm_rank_0                  group_gemm_wait                  899568       2663         64      37744    1815672   12.7%
-mega_dispatch_group_gemm_rank_0                  group_gemm_preprocess            899568          7          8          8         12    0.0%
-mega_dispatch_group_gemm_rank_0                  dispatch_token_tail_notify        13568         47         12        332        832    0.0%
+mega_dispatch_group_gemm_rank_0                  group_gemm_main                  899568      15363      15420      18084     120727   79.3%
+mega_dispatch_group_gemm_rank_0                  dispatch_token_main               10176     131175     168642     278399     327164    7.7%
+mega_dispatch_group_gemm_rank_0                  group_gemm_wait                  899568       1405        104      12892    1371188    7.3%
+mega_dispatch_group_gemm_rank_0                  dispatch_token_tail_notify        10176      97693         36     451263    1693920    5.7%
+mega_dispatch_group_gemm_rank_0                  group_gemm_preprocess            899568         10          8         12         20    0.1%
 ------------------------------------------------------------------------------------------------------------------------
-mega_group_gemm_combine_rank_0                   combine_scatter_token             13568     685842     687550     701787     703876   49.8%
-mega_group_gemm_combine_rank_0                   group_gemm_main                  1574244       4995       4068      10108      12672   42.1%
-mega_group_gemm_combine_rank_0                   group_gemm_tail_notify           1574244        656        528       2952       6892    5.5%
-mega_group_gemm_combine_rank_0                   combine_topk_reduce               13568      35392      19088      48879    1843936    2.6%
-mega_group_gemm_combine_rank_0                   group_gemm_preprocess            1574244          5          4          8         36    0.0%
+mega_group_gemm_combine_rank_0                   group_gemm_main                  1574244       4014       3876       5356     105285   49.4%
+mega_group_gemm_combine_rank_0                   combine_scatter_token             10176     472352     470820     507177     571515   37.6%
+mega_group_gemm_combine_rank_0                   group_gemm_tail_notify           1574244        666        660       1064     101055    8.2%
+mega_group_gemm_combine_rank_0                   combine_topk_reduce               10176      59233      35132     823669    1643224    4.7%
+mega_group_gemm_combine_rank_0                   group_gemm_preprocess            1574244          6          4         12        148    0.1%
 ------------------------------------------------------------------------------------------------------------------------
-==========================================================================
 ```
 
 Note the tension with the wall-clock ablation: the profiler shows

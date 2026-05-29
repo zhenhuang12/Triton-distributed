@@ -39,8 +39,6 @@ def calculate_settings(n):
             f"Cannot launch Triton kernel since n = {n} exceeds the recommended Triton blocksize = {MAX_FUSED_SIZE}.")
     num_warps = 4
     if BLOCK_SIZE >= 32768:
-        num_warps = 32
-    elif BLOCK_SIZE >= 8192:
         num_warps = 16
     elif BLOCK_SIZE >= 2048:
         num_warps = 8
@@ -156,6 +154,12 @@ def _swiglu_backward_kernel(
     dC_ptr += row_idx * dC_row_stride
     A_ptr += row_idx * A_row_stride
     B_ptr += row_idx * B_row_stride
+    # BUGFIX: the output pointers must also advance to this row. Without these
+    # two lines every program instance writes its result to row 0 of dAB,
+    # racing on row 0 and leaving rows 1..n-1 as uninitialized empty_like
+    # garbage -> grad_fc1_output (and thus grad_fc1 / grad_hidden) was wrong.
+    dA_ptr += row_idx * dA_row_stride
+    dB_ptr += row_idx * dB_row_stride
 
     dC_row = tl.load(dC_ptr + col_offsets, mask=mask, other=0)
     A_row = tl.load(A_ptr + col_offsets, mask=mask, other=0).to(tl.float32)
@@ -208,6 +212,9 @@ def _swiglu_backward_kernel_persistent(
     dC_ptr += row_start * dC_row_stride
     A_ptr += row_start * A_row_stride
     B_ptr += row_start * B_row_stride
+    # BUGFIX: advance output pointers too (see _swiglu_backward_kernel).
+    dA_ptr += row_start * dA_row_stride
+    dB_ptr += row_start * dB_row_stride
 
     for row_idx in range(row_start, row_end):
         dC_row = tl.load(dC_ptr + col_offsets, mask=mask, other=0)
@@ -234,6 +241,8 @@ def _swiglu_backward_kernel_persistent(
         dC_ptr += dC_row_stride
         A_ptr += A_row_stride
         B_ptr += B_row_stride
+        dA_ptr += dA_row_stride
+        dB_ptr += dB_row_stride
 
 
 def swiglu_forward(AB, scale=None, sm_margin=0, use_aot=False):

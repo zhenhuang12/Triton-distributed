@@ -28,50 +28,90 @@ import triton
 import triton.language as tl
 from triton_dist.language.extra.hip.language_extra import tid, st, ld
 from typing import Any
-
+from triton.language import core
 
 # ---------------------------------------------------------------------------
 # AMD vectorized scalar loads / stores.
 #
 # The NVIDIA file uses PTX inline-asm to emit ``ld.global.v2/v4`` and
-# ``st.global.v2/v4`` so that one warp can issue a single 128-bit transaction
-# returning four 32-bit values. On AMD/HIP we can rely on the Triton AMD
-# backend to coalesce four consecutive ``tl.load`` / ``tl.store`` calls over
-# uint32 lanes into a single ``global_load_dwordx4`` / ``global_store_dwordx4``
-# instruction. We therefore expose load_v2/load_v4/store_v2/store_v4 as
-# ``@triton.jit`` helpers that issue 2 or 4 scalar loads/stores. The "suffix"
-# argument is preserved for API parity but ignored: ``b32`` and ``u32`` are
-# the only suffixes actually used by callers, and we always operate on uint32
-# lanes (the same width the PTX path used internally).
+# ``st.global.v2/v4`` so that one lane can issue a single 64-/128-bit
+# transaction returning two / four 32-bit values.
+#
+# On AMD/HIP the obvious port -- four consecutive ``tl.load`` / ``tl.store``
+# calls over a per-lane *scalar* (0-d) pointer -- is WRONG: the Triton AMD
+# backend treats a 0-d memory op as uniform and only one lane of the wave
+# actually executes it (the other 63 lanes are dropped). ``copy_warp`` hands
+# each lane its own scalar ``src_ptr + vec_idx * 16`` pointer, so the scalar
+# port silently copies 1/64 of the data.
+#
+# We therefore emit the ``global_load_dwordx4`` / ``global_store_dwordx4``
+# (and the dwordx2 tail variants) through ``inline_asm_elementwise``, which
+# is genuinely per-lane. ``global_*_dwordx4`` needs its 128-bit data operand
+# in four *consecutive*, 4-aligned VGPRs, but Triton inline-asm operands top
+# out at a 64-bit (i64) register pair -- there is no way to express a single
+# 128-bit operand. We work around this by issuing the transfer through a
+# fixed, clobber-declared aligned VGPR group (``v[8:11]`` / ``v[8:9]``) and
+# moving the lanes in/out of the caller's operands with ``v_mov_b32``. The
+# ``~{v8}`` ... clobbers keep the register allocator off that group.
+#
+# The "suffix" argument is preserved for API parity but ignored: ``b32`` and
+# ``u32`` are the only suffixes actually used by callers, and we always
+# operate on uint32 lanes (the same width the PTX path used internally).
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def load_v2(ptr, suffix: tl.constexpr):
+def load_v2(ptr, suffix: core.constexpr):
     p = ptr.to(tl.pointer_type(tl.uint32))
     return tl.load(p + 0), tl.load(p + 1)
 
 
+@core.extern
+def store_v2(ptr, val0, val1, suffix: core.constexpr, _semantic=None):
+    return tl.inline_asm_elementwise(
+        asm=("v_mov_b32 v8, $2\n"
+             "v_mov_b32 v9, $3\n"
+             "global_store_dwordx2 $1, v[8:9], off"),
+        constraints="=v,v,v,v,~{v8},~{v9}",  # $0 dummy output (unused)
+        args=[
+            tl.cast(ptr, dtype=tl.pointer_type(tl.uint32), _semantic=_semantic),
+            tl.cast(val0, dtype=tl.uint32, bitcast=True, _semantic=_semantic),
+            tl.cast(val1, dtype=tl.uint32, bitcast=True, _semantic=_semantic),
+        ],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
 @triton.jit
-def load_v4(ptr, suffix: tl.constexpr):
+def load_v4(ptr, suffix: core.constexpr):
     p = ptr.to(tl.pointer_type(tl.uint32))
     return tl.load(p + 0), tl.load(p + 1), tl.load(p + 2), tl.load(p + 3)
 
 
-@triton.jit
-def store_v2(ptr, val0, val1, suffix: tl.constexpr):
-    p = ptr.to(tl.pointer_type(tl.uint32))
-    tl.store(p + 0, tl.cast(val0, tl.uint32, bitcast=True))
-    tl.store(p + 1, tl.cast(val1, tl.uint32, bitcast=True))
-
-
-@triton.jit
-def store_v4(ptr, val0, val1, val2, val3, suffix: tl.constexpr):
-    p = ptr.to(tl.pointer_type(tl.uint32))
-    tl.store(p + 0, tl.cast(val0, tl.uint32, bitcast=True))
-    tl.store(p + 1, tl.cast(val1, tl.uint32, bitcast=True))
-    tl.store(p + 2, tl.cast(val2, tl.uint32, bitcast=True))
-    tl.store(p + 3, tl.cast(val3, tl.uint32, bitcast=True))
+@core.extern
+def store_v4(ptr, val0, val1, val2, val3, suffix: core.constexpr, _semantic=None):
+    return tl.inline_asm_elementwise(
+        asm=("v_mov_b32 v8, $2\n"
+             "v_mov_b32 v9, $3\n"
+             "v_mov_b32 v10, $4\n"
+             "v_mov_b32 v11, $5\n"
+             "global_store_dwordx4 $1, v[8:11], off nt"),
+        constraints="=v,v,v,v,v,v,~{v8},~{v9},~{v10},~{v11}",  # $0 dummy output (unused)
+        args=[
+            tl.cast(ptr, dtype=tl.pointer_type(tl.uint32), _semantic=_semantic),
+            tl.cast(val0, dtype=tl.uint32, bitcast=True, _semantic=_semantic),
+            tl.cast(val1, dtype=tl.uint32, bitcast=True, _semantic=_semantic),
+            tl.cast(val2, dtype=tl.uint32, bitcast=True, _semantic=_semantic),
+            tl.cast(val3, dtype=tl.uint32, bitcast=True, _semantic=_semantic),
+        ],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -103,30 +143,29 @@ def unpack_bf16x2_f32(v1, v2, v3, v4):
     ``float32`` scalars.
 
     NVIDIA emits this with ``mov.b32 {b0, b1}, $i`` followed by ``cvt.f32.bf16``.
-    On AMD we bitcast the int32 to a 2-wide ``bfloat16`` tensor, then convert
-    to fp32; both operations are supported natively by the Triton AMD backend.
+    On AMD there is no need for a cvt at all: bf16 and f32 share the same 8-bit
+    exponent, so a bf16 is exactly the high 16 bits of an f32 with a zeroed
+    mantissa tail. The widening is therefore a pure bit-extension that is
+    *bit-exact* for every value (including NaN/Inf/denormals):
+
+      * low  bf16 -> shift it up into the high half  (``v_lshlrev_b32 16``)
+      * high bf16 -> mask off the low half           (``v_and_b32 0xffff0000``)
+
+    Each output is a single ALU op; no bf16 temporary, no rounding.
     """
     a = tl.cast(v1, tl.uint32, bitcast=True)
     b = tl.cast(v2, tl.uint32, bitcast=True)
     c = tl.cast(v3, tl.uint32, bitcast=True)
     d = tl.cast(v4, tl.uint32, bitcast=True)
-    # Use 16-bit extracts then bitcast each half to bf16, finally widen to f32.
-    a0 = tl.cast(a & 0xFFFF, tl.uint16).to(tl.uint16, bitcast=True)
-    a1 = tl.cast(a >> 16, tl.uint16).to(tl.uint16, bitcast=True)
-    b0 = tl.cast(b & 0xFFFF, tl.uint16).to(tl.uint16, bitcast=True)
-    b1 = tl.cast(b >> 16, tl.uint16).to(tl.uint16, bitcast=True)
-    c0 = tl.cast(c & 0xFFFF, tl.uint16).to(tl.uint16, bitcast=True)
-    c1 = tl.cast(c >> 16, tl.uint16).to(tl.uint16, bitcast=True)
-    d0 = tl.cast(d & 0xFFFF, tl.uint16).to(tl.uint16, bitcast=True)
-    d1 = tl.cast(d >> 16, tl.uint16).to(tl.uint16, bitcast=True)
-    f0 = tl.cast(a0, tl.bfloat16, bitcast=True).to(tl.float32)
-    f1 = tl.cast(a1, tl.bfloat16, bitcast=True).to(tl.float32)
-    f2 = tl.cast(b0, tl.bfloat16, bitcast=True).to(tl.float32)
-    f3 = tl.cast(b1, tl.bfloat16, bitcast=True).to(tl.float32)
-    f4 = tl.cast(c0, tl.bfloat16, bitcast=True).to(tl.float32)
-    f5 = tl.cast(c1, tl.bfloat16, bitcast=True).to(tl.float32)
-    f6 = tl.cast(d0, tl.bfloat16, bitcast=True).to(tl.float32)
-    f7 = tl.cast(d1, tl.bfloat16, bitcast=True).to(tl.float32)
+    HI: tl.constexpr = tl.constexpr(0xFFFF0000)
+    f0 = tl.cast(a << 16, tl.float32, bitcast=True)
+    f1 = tl.cast(a & HI, tl.float32, bitcast=True)
+    f2 = tl.cast(b << 16, tl.float32, bitcast=True)
+    f3 = tl.cast(b & HI, tl.float32, bitcast=True)
+    f4 = tl.cast(c << 16, tl.float32, bitcast=True)
+    f5 = tl.cast(c & HI, tl.float32, bitcast=True)
+    f6 = tl.cast(d << 16, tl.float32, bitcast=True)
+    f7 = tl.cast(d & HI, tl.float32, bitcast=True)
     return f0, f1, f2, f3, f4, f5, f6, f7
 
 

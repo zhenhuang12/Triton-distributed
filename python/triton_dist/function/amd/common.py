@@ -95,7 +95,7 @@ def set_triton_dist_moe_profile_enabled(
 ) -> None:
     """
     Enable or disable Ditron MoE profiling.
-    
+
     Args:
         enabled: Whether to enable profiling.
         fwd_dispatch: Whether to profile forward dispatch.
@@ -120,7 +120,7 @@ def set_triton_dist_moe_profile_enabled(
 def get_triton_dist_moe_profile_enabled() -> dict:
     """
     Get current Ditron MoE profiling state.
-    
+
     Returns:
         Dictionary with profiling flags for each operation.
     """
@@ -445,15 +445,15 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
     if is_forward:
         if use_mega:
             return MoEOptimConfig(
-                num_build_sms=8,
+                num_build_sms=16,
                 num_copy_sms=max_sms,
                 num_group_gemm_warps=4,
                 num_dispatch_warps=16,
                 num_combine_warps=16,
-                num_dispatch_sms=32,
+                num_dispatch_sms=80,
                 num_tail_sms_in_dispatch=16,
-                num_combine_sms=32,
-                num_reduce_sms_in_combine=32,
+                num_combine_sms=80,
+                num_reduce_sms_in_combine=80,
                 dispatch_use_block_wise_barrier=True,
             )
         else:
@@ -472,15 +472,15 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
     else:  # backward
         if use_mega:
             return MoEOptimConfig(
-                num_build_sms=8,
+                num_build_sms=16,
                 num_copy_sms=max_sms,
-                num_group_gemm_warps=8,
-                num_dispatch_warps=8,
-                num_combine_warps=8,
-                num_dispatch_sms=32,
+                num_group_gemm_warps=4,
+                num_dispatch_warps=16,
+                num_combine_warps=16,
+                num_dispatch_sms=96,
                 num_tail_sms_in_dispatch=16,
                 num_combine_sms=32,
-                num_reduce_sms_in_combine=32,
+                num_reduce_sms_in_combine=16,
                 dispatch_use_block_wise_barrier=True,
             )
         else:

@@ -22,7 +22,6 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-
 """
 AMD parity of the NVIDIA fused EP MoE end-to-end test
 (``python/triton_dist/test/nvidia/test_ep_moe_fused.py``).
@@ -74,6 +73,47 @@ from triton_dist.utils import (
 )
 from triton_dist.profiler_utils import benchmark_latency_memory, print_benchmark_comparison
 
+# Gate-3 thresholds for the turbo-vs-triton-dist precision check, mirroring
+# the Primus-Turbo mega-MoE Gate-3 convention (MegaKernel/CLAUDE.md). Both
+# must hold simultaneously per compared tensor. Tighten by editing here.
+_PRECISION_COS_SIM_MIN = 0.99
+_PRECISION_REL_RMSE_MAX = 0.05
+
+
+def _precision_metrics(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
+    """Return (cos_sim, rel_rmse) between two same-shape tensors in float64.
+
+    `cos_sim` catches structural divergence (wrong wiring); `rel_rmse`
+    bounds BF16 round-off + dispatch reorder noise. Both are computed in
+    float64 to avoid the metric itself swamping the signal at BF16.
+    """
+    assert a.shape == b.shape, f"shape mismatch: {tuple(a.shape)} vs {tuple(b.shape)}"
+    af = a.detach().to(torch.float64).flatten()
+    bf = b.detach().to(torch.float64).flatten()
+    denom = (af.norm() * bf.norm()).clamp_min(1e-30)
+    cos_sim = float((af @ bf) / denom)
+    diff = af - bf
+    ref_norm = af.norm().clamp_min(1e-30)
+    rel_rmse = float((diff.norm() / ref_norm))
+    return cos_sim, rel_rmse
+
+
+def _check_precision(name: str, ref: torch.Tensor, candidate: torch.Tensor) -> bool:
+    """Compare two tensors and print a one-line report. Returns pass/fail.
+
+    Report format mirrors Primus-Turbo's `[mega_moe-jit] y numerics report`
+    so the metric line reads the same across both repos.
+    """
+    cos_sim, rel_rmse = _precision_metrics(ref, candidate)
+    passed = (cos_sim >= _PRECISION_COS_SIM_MIN) and (rel_rmse <= _PRECISION_REL_RMSE_MAX)
+    status = "PASS" if passed else "FAIL"
+    print(f"[ep_moe_fused] precision {name}: cos_sim={cos_sim:.6f} "
+          f"rel_rmse={rel_rmse:.6f} "
+          f"(thresholds cos_sim>={_PRECISION_COS_SIM_MIN:.4f} & "
+          f"rel_rmse<={_PRECISION_REL_RMSE_MAX:.4f}) {status}")
+    return passed
+
+
 # In-process aggregator for the in-kernel ENABLE_PROFILING records.
 # Populated by ``_install_kernel_profile_aggregator`` (only when --enable-kernel-profiler).
 # Layout: {kernel_label: {task_name: [duration_ns, ...]}}
@@ -95,7 +135,7 @@ def _install_kernel_profile_aggregator():
     _original_export = _layer.export_to_perfetto_trace
 
     def _wrapped_export(profiler_buffer, task_names, file_name, *args, **kwargs):
-        try: 
+        try:
             tracks = parse_to_tracks(profiler_buffer)
             kernel_label = os.path.basename(file_name)
             bucket = _KERNEL_PROFILE_STATS.setdefault(kernel_label, {})
@@ -171,12 +211,14 @@ def parse_args():
     # forward-only path alive while bisecting backward-kernel issues.
     parser.add_argument("--skip_backward", action="store_true",
                         help="Run forward only (for debugging only; the NVIDIA test always runs forward+backward).")
-    parser.add_argument("--enable-kernel-profiler", action="store_true",
-                        help="Enable the in-kernel ENABLE_PROFILING records (perfetto + per-task summary). "
-                             "Perturbs timing; use small --warmup/--iters when set.")
-    parser.add_argument("--max-tokens-per-rank", type=int, default=None,
-                        help="Override the EP-op symm-heap sizing tile (default 8192*4). "
-                             "Lower this when the mori/rocshmem heap can't hold the default.")
+    parser.add_argument(
+        "--enable-kernel-profiler", action="store_true",
+        help="Enable the in-kernel ENABLE_PROFILING records (perfetto + per-task summary). "
+        "Perturbs timing; use small --warmup/--iters when set.")
+    parser.add_argument(
+        "--max-tokens-per-rank", type=int, default=None,
+        help="Override the EP-op symm-heap sizing tile (default 8192*4). "
+        "Lower this when the mori/rocshmem heap can't hold the default.")
     return parser.parse_args()
 
 
@@ -237,9 +279,7 @@ def prepare_inputs(
     # ``gate_logits.gather(1, expert_index)`` internally to recover
     # ``gate_weights``. Overwrites the raw topk source above; the topk
     # decision is already captured in ``expert_index``.
-    gate_logits = torch.zeros(
-        ntokens_per_rank_list[rank], num_experts, dtype=torch.float32, device=device
-    )
+    gate_logits = torch.zeros(ntokens_per_rank_list[rank], num_experts, dtype=torch.float32, device=device)
     gate_logits.scatter_(1, expert_index.long(), gate_weights.float())
 
     # Randomly drop some tokens (set expert_index to num_experts)
@@ -294,9 +334,8 @@ def turbo_ep_moe(weights, activations, dispatcher):
     # num_experts] probs tensor that DeepEPTokenDispatcher expects;
     # internally token_dispatch does gate_logits.gather(1, indices) to
     # recover the topk weights, so we skip the per-call scatter here.
-    permuted_hidden, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
-        hidden_states, gate_logits, indices=expert_index.long()
-    )
+    permuted_hidden, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(hidden_states, gate_logits,
+                                                                                   indices=expert_index.long())
 
     group_lens = tokens_per_expert.to(device=hidden_states.device, dtype=torch.int64)
 
@@ -316,7 +355,9 @@ def turbo_ep_moe(weights, activations, dispatcher):
 
     fc2_out = grouped_gemm(intermediate, fc2, group_lens, trans_b=True)
 
-    return dispatcher.token_combine(fc2_out)
+    combine_output = dispatcher.token_combine(fc2_out)
+
+    return combine_output
 
 
 def uniform_split_tokens(ntokens, nsplits):
@@ -455,11 +496,10 @@ def main():
             # active to cover every config; otherwise narrow sweeps
             # (e.g. EP_NTOKENS_MIN filtering down to 1-2 configs) never
             # reach the active window and the exported trace is empty.
-            ctx = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                          schedule=torch.profiler.schedule(wait=0, warmup=0,
-                                                           active=max(1, len(test_configs)),
-                                                           repeat=1),
-                          record_shapes=True, profile_memory=True)
+            ctx = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=0, warmup=0, active=max(1, len(test_configs)),
+                                                 repeat=1), record_shapes=True, profile_memory=True)
         else:
             ctx = nullcontext()
         with ctx as prof:
@@ -490,56 +530,12 @@ def main():
 
                 torch.distributed.barrier(EP_GROUP)
 
-                fc1_1, fc1_2, fc2 = weights
-                hidden_states, gate_weights, expert_index, _, _ = activations
-
-                # Benchmark functions
-                def triton_dist_fwd():
-                    return triton_dist_moe_func(weights, activations, EP_GROUP)
-
-                def turbo_fwd():
-                    return turbo_ep_moe(weights, activations, turbo_dispatcher)
-
-                def zero_grads():
-                    if fc1_1.grad is not None:
-                        fc1_1.grad.zero_()
-                    if fc1_2 is not None and fc1_2.grad is not None:
-                        fc1_2.grad.zero_()
-                    if fc2.grad is not None:
-                        fc2.grad.zero_()
-                    if hidden_states.grad is not None:
-                        hidden_states.grad.zero_()
-                    if gate_weights.grad is not None:
-                        gate_weights.grad.zero_()
-
-                def triton_dist_fwd_bwd():
-                    output = triton_dist_moe_func(weights, activations, EP_GROUP)
-                    output.backward(grad_output)
-                    return output
-
-                def turbo_fwd_bwd():
-                    output = turbo_ep_moe(weights, activations, turbo_dispatcher)
-                    output.backward(grad_output)
-                    return output
-
-                # Benchmark
-                triton_dist_fwd_time, triton_dist_fwd_mem = (0.0, 0.0)
-                triton_dist_fwd_bwd_time, triton_dist_fwd_bwd_mem = (0.0, 0.0)
-                turbo_fwd_bwd_time, turbo_fwd_bwd_mem = (0.0, 0.0)
-
-                triton_dist_fwd_time, triton_dist_fwd_mem = benchmark_latency_memory(
-                    triton_dist_fwd, args.iters, args.warmup)
-                if not args.skip_backward:
-                    triton_dist_fwd_bwd_time, triton_dist_fwd_bwd_mem = benchmark_latency_memory(
-                        triton_dist_fwd_bwd, args.iters, args.warmup, pre_func=zero_grads)
-
-                with torch.no_grad():
-                    turbo_fwd_time, turbo_fwd_mem = benchmark_latency_memory(
-                        turbo_fwd, args.iters, args.warmup)
-                if not args.skip_backward:
-                    turbo_fwd_bwd_time, turbo_fwd_bwd_mem = benchmark_latency_memory(
-                        turbo_fwd_bwd, args.iters, args.warmup, pre_func=zero_grads)
-
+                # NOTE: precision check runs BEFORE perf benchmarks so the
+                # turbo_dispatcher singleton and the rocshmem/mori symm heap
+                # haven't been churned by warmup+iters loops yet. Running
+                # precision after perf was producing cos_sim ≈ 0 / rel_rmse ≈ 1
+                # because turbo_fwd_bwd (no torch.no_grad()) leaked autograd
+                # state across the shared dispatcher into the precision call.
                 # Precision check: use the same inputs for both implementations
                 # Prepare reference inputs once and clone for both implementations
                 weights_ref, activations_ref, grad_output_ref = prepare_inputs(
@@ -577,10 +573,111 @@ def main():
                 if not args.skip_backward:
                     output_triton_dist.backward(grad_output_triton_dist)
 
-                # Compare outputs and gradients
-                # TODO: add torch as baseline
-                fwd_precision = True
-                bwd_precision = True
+                # Clone inputs a second time for the turbo baseline so its
+                # backward populates a disjoint set of .grad buffers. Mirrors
+                # the triton_dist clone block above; the fifth activations
+                # slot is `gate_logits` (turbo path) instead of `None`.
+                fc1_1_turbo = fc1_1_ref.clone().detach().requires_grad_(True)
+                fc1_2_turbo = fc1_2_ref.clone().detach().requires_grad_(True) if fc1_2_ref is not None else None
+                fc2_turbo = fc2_ref.clone().detach().requires_grad_(True)
+                hidden_states_turbo = hidden_states_ref.clone().detach().requires_grad_(True)
+                gate_logits_ref = activations_ref[4]
+                gate_logits_turbo = (gate_logits_ref.clone().detach().requires_grad_(True)
+                                     if gate_logits_ref is not None else None)
+                expert_index_turbo = expert_index_ref.clone()
+                grad_output_turbo = grad_output_ref.clone()
+
+                weights_turbo = (fc1_1_turbo, fc1_2_turbo, fc2_turbo)
+                activations_turbo = (hidden_states_turbo, None, expert_index_turbo, token_splits, gate_logits_turbo)
+
+                output_turbo = turbo_ep_moe(weights_turbo, activations_turbo, turbo_dispatcher)
+                if not args.skip_backward:
+                    output_turbo.backward(grad_output_turbo)
+
+                # Compare outputs and gradients against the turbo baseline.
+                # Per-tensor gates use the Primus-Turbo Gate-3 thresholds
+                # (cos_sim >= 0.99 & rel_rmse <= 0.05). gate_weights vs
+                # gate_logits is intentionally skipped — they encode the
+                # topk weights through different tensors with different
+                # shapes, so their .grad is not directly comparable.
+                fwd_gates = [_check_precision("fwd output", output_turbo, output_triton_dist)]
+
+                bwd_gates: list[bool] = []
+                if not args.skip_backward:
+                    bwd_gates.append(
+                        _check_precision(
+                            "bwd grad hidden_states",
+                            hidden_states_turbo.grad,
+                            hidden_states_triton_dist.grad,
+                        ))
+                    bwd_gates.append(_check_precision(
+                        "bwd grad fc1_1",
+                        fc1_1_turbo.grad,
+                        fc1_1_triton_dist.grad,
+                    ))
+                    if fc1_2_turbo is not None and fc1_2_triton_dist is not None:
+                        bwd_gates.append(_check_precision(
+                            "bwd grad fc1_2",
+                            fc1_2_turbo.grad,
+                            fc1_2_triton_dist.grad,
+                        ))
+                    bwd_gates.append(_check_precision(
+                        "bwd grad fc2",
+                        fc2_turbo.grad,
+                        fc2_triton_dist.grad,
+                    ))
+
+                fwd_precision = all(fwd_gates)
+                bwd_precision = all(bwd_gates) if not args.skip_backward else True
+
+                # Now run the perf benchmarks (precision was already collected
+                # above against a fresh symm heap / dispatcher state).
+                fc1_1, fc1_2, fc2 = weights
+                hidden_states, gate_weights, expert_index, _, _ = activations
+
+                def triton_dist_fwd():
+                    return triton_dist_moe_func(weights, activations, EP_GROUP)
+
+                def turbo_fwd():
+                    return turbo_ep_moe(weights, activations, turbo_dispatcher)
+
+                def zero_grads():
+                    if fc1_1.grad is not None:
+                        fc1_1.grad.zero_()
+                    if fc1_2 is not None and fc1_2.grad is not None:
+                        fc1_2.grad.zero_()
+                    if fc2.grad is not None:
+                        fc2.grad.zero_()
+                    if hidden_states.grad is not None:
+                        hidden_states.grad.zero_()
+                    if gate_weights.grad is not None:
+                        gate_weights.grad.zero_()
+
+                def triton_dist_fwd_bwd():
+                    output = triton_dist_moe_func(weights, activations, EP_GROUP)
+                    output.backward(grad_output)
+                    return output
+
+                def turbo_fwd_bwd():
+                    output = turbo_ep_moe(weights, activations, turbo_dispatcher)
+                    output.backward(grad_output)
+                    return output
+
+                triton_dist_fwd_time, triton_dist_fwd_mem = (0.0, 0.0)
+                triton_dist_fwd_bwd_time, triton_dist_fwd_bwd_mem = (0.0, 0.0)
+                turbo_fwd_bwd_time, turbo_fwd_bwd_mem = (0.0, 0.0)
+
+                triton_dist_fwd_time, triton_dist_fwd_mem = benchmark_latency_memory(
+                    triton_dist_fwd, args.iters, args.warmup)
+                if not args.skip_backward:
+                    triton_dist_fwd_bwd_time, triton_dist_fwd_bwd_mem = benchmark_latency_memory(
+                        triton_dist_fwd_bwd, args.iters, args.warmup, pre_func=zero_grads)
+
+                with torch.no_grad():
+                    turbo_fwd_time, turbo_fwd_mem = benchmark_latency_memory(turbo_fwd, args.iters, args.warmup)
+                if not args.skip_backward:
+                    turbo_fwd_bwd_time, turbo_fwd_bwd_mem = benchmark_latency_memory(
+                        turbo_fwd_bwd, args.iters, args.warmup, pre_func=zero_grads)
 
                 # Create benchmark results structure
                 implementations = {}
@@ -593,11 +690,19 @@ def main():
                     'latency': triton_dist_fwd_bwd_time, 'memory': triton_dist_fwd_bwd_mem, 'precision':
                     bwd_precision if output_triton_dist is not None else 'N/A'
                 }
+                # turbo_* rows carry the same booleans because the comparison
+                # is symmetric — turbo is the reference and triton_dist is the
+                # candidate, but the gate (cos_sim & rel_rmse) is one decision
+                # per direction, so both rows show identical ✅/❌.
                 implementations['turbo_fwd'] = {
-                    'latency': turbo_fwd_time, 'memory': turbo_fwd_mem, 'precision': 'N/A'
+                    'latency': turbo_fwd_time,
+                    'memory': turbo_fwd_mem,
+                    'precision': fwd_precision if output_turbo is not None else 'N/A',
                 }
                 implementations['turbo_fwd_bwd'] = {
-                    'latency': turbo_fwd_bwd_time, 'memory': turbo_fwd_bwd_mem, 'precision': 'N/A'
+                    'latency': turbo_fwd_bwd_time,
+                    'memory': turbo_fwd_bwd_mem,
+                    'precision': bwd_precision if output_turbo is not None else 'N/A',
                 }
 
                 config_key = (ntokens, hidden_dim, ffn_dim)
@@ -615,8 +720,8 @@ def main():
         # finalizers (autograd-saved tensors in particular) try to free
         # already-released symm-heap blocks during interpreter shutdown
         # and SIGSEGV. Same pattern as test_gemm_rs_intra_node.py.
-        del (output_triton_dist, weights, activations, grad_output,
-             weights_triton_dist, activations_triton_dist, grad_output_triton_dist,
+        del (output_triton_dist, output_turbo, weights, activations, grad_output, weights_triton_dist,
+             activations_triton_dist, grad_output_triton_dist, weights_turbo, activations_turbo, grad_output_turbo,
              weights_ref, activations_ref, grad_output_ref)
         gc.collect()
         torch.cuda.synchronize()
