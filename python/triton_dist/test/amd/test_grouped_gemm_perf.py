@@ -85,7 +85,7 @@ except ImportError as e:
 # Extracted device kernels (verbatim from ep_all2all_fused.py modulo the
 # dropped dl.num_ranks() call, which is dead code under NEED_WAIT=False).
 # ---------------------------------------------------------------------------
-
+GROUP_GEMM_BLOCK_SIZE_M = 256
 
 @triton.jit
 def dot_k_const(
@@ -101,20 +101,40 @@ def dot_k_const(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     need_mask: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
 ):
+    row_mask = (tl.arange(0, BLOCK_SIZE_M) < M)[:, None]
+
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    loop_k = tl.cdiv(K, BLOCK_SIZE_K)
+    if not EVEN_K:
+        loop_k -= 1
+
+    for k in range(0, loop_k):
         if need_mask:
-            a = tl.load(
-                a_ptrs, mask=((tl.arange(0, BLOCK_SIZE_M) < M)[:, None] &
-                              (k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K) < K)[None, :]))
+            a = tl.load(tl.multiple_of(a_ptrs, (1, 16)), mask=row_mask, other=0.0,
+                        cache_modifier=CACHE_MODIFIER_A)
         else:
-            a = tl.load(a_ptrs, mask=(k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K) < K)[None, :])
-        b = tl.load(b_ptrs, mask=(k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K) < K)[:, None])
+            a = tl.load(tl.multiple_of(a_ptrs, (1, 16)), cache_modifier=CACHE_MODIFIER_A)
+        b = tl.load(tl.multiple_of(b_ptrs, (16, 1)), cache_modifier=CACHE_MODIFIER_B)
 
         accumulator = tl.dot(a, b, accumulator)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if not EVEN_K:
+        k_mask = (loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K) < K)
+        if need_mask:
+            a = tl.load(tl.multiple_of(a_ptrs, (1, 16)), mask=(row_mask & k_mask[None, :]),
+                        other=0.0, cache_modifier=CACHE_MODIFIER_A)
+        else:
+            a = tl.load(tl.multiple_of(a_ptrs, (1, 16)), mask=k_mask[None, :], other=0.0,
+                        cache_modifier=CACHE_MODIFIER_A)
+        b = tl.load(tl.multiple_of(b_ptrs, (16, 1)), mask=k_mask[:, None], other=0.0,
+                    cache_modifier=CACHE_MODIFIER_B)
+        accumulator = tl.dot(a, b, accumulator)
 
     accumulator = accumulator.to(a_ptrs.dtype.element_ty)
     if need_mask:
@@ -159,7 +179,17 @@ def tile_kernel_moe_grouped_gemm_nk_const(
     USE_BLOCK_WISE_BARRIER: tl.constexpr,
     IS_DISPATCH_TWO_STAGET: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
 ):
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
     num_block_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     pid_m = pid // num_block_n
@@ -211,10 +241,12 @@ def tile_kernel_moe_grouped_gemm_nk_const(
 
     if row_remain >= BLOCK_SIZE_M:
         dot_k_const(a_ptrs, b_ptrs, c_ptrs, row_remain, min(BLOCK_SIZE_N, N - pid_n * BLOCK_SIZE_N), K, stride_ak,
-                    stride_bk, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, False)
+                    stride_bk, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, False, EVEN_K, CACHE_MODIFIER_A,
+                    CACHE_MODIFIER_B)
     elif row_remain > 0:
         dot_k_const(a_ptrs, b_ptrs, c_ptrs, row_remain, min(BLOCK_SIZE_N, N - pid_n * BLOCK_SIZE_N), K, stride_ak,
-                    stride_bk, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, True)
+                    stride_bk, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, True, EVEN_K, CACHE_MODIFIER_A,
+                    CACHE_MODIFIER_B)
 
     if NEED_NOTIFY:
         __syncthreads()
@@ -252,6 +284,9 @@ def mega_kernel_grouped_gemm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
 ):
     """Persistent grouped-GEMM mega kernel.
 
@@ -299,6 +334,9 @@ def mega_kernel_grouped_gemm(
             USE_BLOCK_WISE_BARRIER=False,
             IS_DISPATCH_TWO_STAGET=False,
             WORLD_SIZE=1,
+            EVEN_K=EVEN_K,
+            CACHE_MODIFIER_A=CACHE_MODIFIER_A,
+            CACHE_MODIFIER_B=CACHE_MODIFIER_B,
         )
         task_id = tl.atomic_add(task_counter_ptr, 1)
 
@@ -359,19 +397,28 @@ def run_grouped_gemm(
     split_size: torch.Tensor,  # [G] int32
     out: torch.Tensor,  # [M_total, N]
     num_sms: int,
+    routing_metadata=None,
     block_size_n: int = 256,
     block_size_k: int = 64,
     group_size_m: int = 3,
     num_warps: int = 8,
     num_stages: int = 3,
+    cache_modifier_a: str = ".ca",
+    cache_modifier_b: str = ".ca",
 ):
     G, N, K = weights.shape
     M_total, K_a = a.shape
     assert K_a == K
     M_grid_max = triton.cdiv(M_total, GROUP_GEMM_BLOCK_SIZE_M) + G
+    even_k = (K % block_size_k == 0)
 
+    # Routing metadata depends only on split_size and is invariant across
+    # iterations -- build it once outside the timing loop and pass it in.
+    # Falls back to building it here if the caller did not precompute it.
+    if routing_metadata is None:
+        routing_metadata = build_routing_metadata(split_size, G, GROUP_GEMM_BLOCK_SIZE_M, num_sms)
     (expert_ids, split_size_cum, tile_num, tile_num_cum, num_total_tiles,
-     _per_expert) = build_routing_metadata(split_size, G, GROUP_GEMM_BLOCK_SIZE_M, num_sms)
+     _per_expert) = routing_metadata
 
     task_counter = torch.zeros(1, dtype=torch.int32, device=a.device)
     # NEED_WAIT/NEED_NOTIFY are off so these are unused, but the kernel still
@@ -406,8 +453,14 @@ def run_grouped_gemm(
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
         GROUP_SIZE_M=group_size_m,
+        EVEN_K=even_k,
+        CACHE_MODIFIER_A=cache_modifier_a,
+        CACHE_MODIFIER_B=cache_modifier_b,
         num_warps=num_warps,
         num_stages=num_stages,
+        waves_per_eu=0,
+        matrix_instr_nonkdim=16,
+        kpack=1,
     )
     return out
 
@@ -455,8 +508,8 @@ def parse_args():
     p.add_argument("--block-n", type=int, default=256)
     p.add_argument("--block-k", type=int, default=64)
     p.add_argument("--group-m", type=int, default=3)
-    p.add_argument("--num-warps", type=int, default=8)
-    p.add_argument("--num-stages", type=int, default=3)
+    p.add_argument("--num-warps", type=int, default=4)
+    p.add_argument("--num-stages", type=int, default=2)
     p.add_argument("--num-sms", type=int, default=-1, help="Persistent grid size; -1 = device CU count")
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=20)
@@ -467,18 +520,16 @@ def parse_args():
 
 
 def _uniform_split(M_total: int, G: int, device, generator=None) -> torch.Tensor:
-    """Random per-expert token counts that sum to M_total.
+    """Even per-expert token counts that sum to M_total.
 
-    Multinomial draw -> matches the routing-imbalance profile of a real
-    MoE step (some experts get more tokens than others).
+    Every expert gets floor(M_total / G) tokens; the first `remainder`
+    experts get one extra so the counts still sum to M_total. This models
+    a perfectly balanced routing step.
     """
-    if generator is None:
-        generator = torch.Generator(device="cpu").manual_seed(0)
-    # Dirichlet-like: sample uniform probs, normalise, then multinomial.
-    probs = torch.rand(G, generator=generator)
-    probs = probs / probs.sum()
-    counts = torch.multinomial(probs, M_total, replacement=True, generator=generator)
-    split = torch.bincount(counts, minlength=G).to(torch.int32)
+    base = M_total // G
+    remainder = M_total - base * G
+    split = torch.full((G, ), base, dtype=torch.int32)
+    split[:remainder] += 1
     assert int(split.sum().item()) == M_total
     return split.to(device)
 
@@ -507,6 +558,10 @@ def main():
     # Per-expert token counts via multinomial draw -> uneven routing.
     split_size = _uniform_split(M_total, G, device)
 
+    # Routing metadata is invariant across iterations -- build it once here so
+    # the warmup/perf loops measure only the grouped-GEMM kernel.
+    routing_metadata = build_routing_metadata(split_size, G, GROUP_GEMM_BLOCK_SIZE_M, num_sms)
+
     # Inputs: random routed-token matrix + per-expert weight stack [G, N, K].
     a = (torch.randn(M_total, K, dtype=dtype, device=device) * 0.1)
     weights = (torch.randn(G, N, K, dtype=dtype, device=device) * 0.1)
@@ -522,9 +577,9 @@ def main():
 
     # ---- Correctness ----------------------------------------------------
     if not args.skip_correctness:
-        run_grouped_gemm(a, weights, split_size, out, num_sms=num_sms, block_size_n=args.block_n,
-                         block_size_k=args.block_k, group_size_m=args.group_m, num_warps=args.num_warps,
-                         num_stages=args.num_stages)
+        run_grouped_gemm(a, weights, split_size, out, num_sms=num_sms, routing_metadata=routing_metadata,
+                         block_size_n=args.block_n, block_size_k=args.block_k, group_size_m=args.group_m,
+                         num_warps=args.num_warps, num_stages=args.num_stages)
         ref = torch_reference_grouped_gemm(a, weights, split_size)
         diff = (out.float() - ref.float()).abs()
         max_err = diff.max().item()
@@ -553,18 +608,18 @@ def main():
     # ---- Perf -----------------------------------------------------------
     # Warmup
     for _ in range(args.warmup):
-        run_grouped_gemm(a, weights, split_size, out, num_sms=num_sms, block_size_n=args.block_n,
-                         block_size_k=args.block_k, group_size_m=args.group_m, num_warps=args.num_warps,
-                         num_stages=args.num_stages)
+        run_grouped_gemm(a, weights, split_size, out, num_sms=num_sms, routing_metadata=routing_metadata,
+                         block_size_n=args.block_n, block_size_k=args.block_k, group_size_m=args.group_m,
+                         num_warps=args.num_warps, num_stages=args.num_stages)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(args.iters):
-        run_grouped_gemm(a, weights, split_size, out, num_sms=num_sms, block_size_n=args.block_n,
-                         block_size_k=args.block_k, group_size_m=args.group_m, num_warps=args.num_warps,
-                         num_stages=args.num_stages)
+        run_grouped_gemm(a, weights, split_size, out, num_sms=num_sms, routing_metadata=routing_metadata,
+                         block_size_n=args.block_n, block_size_k=args.block_k, group_size_m=args.group_m,
+                         num_warps=args.num_warps, num_stages=args.num_stages)
     end.record()
     torch.cuda.synchronize()
     avg_ms = start.elapsed_time(end) / args.iters

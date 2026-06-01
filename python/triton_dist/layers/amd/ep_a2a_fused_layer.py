@@ -579,7 +579,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
         gemm_BLOCK_SIZE_N: int = 256,
         gemm_BLOCK_SIZE_K: int = 64,
         gemm_GROUP_SIZE_M: int = 3,
-        gemm_num_stages=3,
+        gemm_num_stages=2,
 
         # common
         use_block_wise_barrier=False,
@@ -784,7 +784,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
         gemm_BLOCK_SIZE_N: int = 256,
         gemm_BLOCK_SIZE_K: int = 64,
         gemm_GROUP_SIZE_M: int = 3,
-        gemm_num_stages=3,
+        gemm_num_stages=2,
 
         # combine token
         gate_input: Optional[torch.Tensor] = None,
@@ -1052,7 +1052,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 profiler_buffer,
                 ENABLE_PROFILING=enable_profiler,
                 num_warps=num_warps,
-                num_stages=gemm_num_stages,
+                num_stages=gemm_num_stages, 
                 matrix_instr_nonkdim=16,
                 waves_per_eu=0,
                 kpack=1,

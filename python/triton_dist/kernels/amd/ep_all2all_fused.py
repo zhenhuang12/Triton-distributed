@@ -360,10 +360,8 @@ def tile_kernel_gather_combine_token_intra_node(
 
                     if HAS_GATE and elem_idx == 0:
                         remote_gate_input_ptr = dl.symm_at(gate_input_buf, expert_rank)
-                        gate_val = ld_b32(remote_gate_input_ptr + token_scatter_idx)
-                        st(
-                            gate_output_buf.to(tl.pointer_type(tl.uint32)) + token_idx * topk + j,
-                            tl.cast(gate_val, dtype=tl.uint32, bitcast=True))
+                        gate_val = tl.load(remote_gate_input_ptr + token_scatter_idx)
+                        tl.store(gate_output_buf + token_idx * topk + j, gate_val)
 
                     if NEED_WAIT:
                         barrier_n_idx = elem_idx * VEC_SIZE // BARRIER_TOKEN_BLOCK_SIZE

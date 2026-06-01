@@ -224,7 +224,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
             gemm_BLOCK_SIZE_N=triton_dist_ep_ctx.ep_op.FWD_GEMM_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K=64,
             gemm_GROUP_SIZE_M=1,
-            gemm_num_stages=3,
+            gemm_num_stages=2,
 
             # common
             use_block_wise_barrier=optim_config.dispatch_use_block_wise_barrier,
@@ -261,7 +261,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
             gemm_BLOCK_SIZE_N=triton_dist_ep_ctx.ep_op.FWD_GEMM_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K=64,
             gemm_GROUP_SIZE_M=1,
-            gemm_num_stages=3,
+            gemm_num_stages=2,
 
             # combine token
             gate_input=None,
@@ -355,7 +355,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
             gemm_BLOCK_SIZE_N=triton_dist_ep_ctx.ep_op.FWD_GEMM_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K=64,
             gemm_GROUP_SIZE_M=1,
-            gemm_num_stages=3,
+            gemm_num_stages=2,
 
             # common
             use_block_wise_barrier=optim_config.dispatch_use_block_wise_barrier,
@@ -388,7 +388,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
                 BLOCK_SIZE_K=256,
                 GROUP_SIZE_M=4,
                 num_warps=optim_config.num_group_gemm_warps,
-                num_stages=3,
+                num_stages=2,
             )
 
         if fc1_2 is not None:
@@ -423,7 +423,7 @@ class TritonDistFusedEpMoeFunction(torch.autograd.Function):
             gemm_BLOCK_SIZE_N=triton_dist_ep_ctx.ep_op.FWD_GEMM_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K=64,
             gemm_GROUP_SIZE_M=1,
-            gemm_num_stages=3,
+            gemm_num_stages=2,
 
             # combine token
             gate_input=grad_gate,

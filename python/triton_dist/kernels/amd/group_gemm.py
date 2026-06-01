@@ -26,9 +26,20 @@
 import triton
 import triton.language as tl
 import torch
+import functools
 from .memory_ops import fill_tensor
 
-GROUP_GEMM_BLOCK_SIZE_M = 128
+@functools.lru_cache(maxsize=1)
+def _is_gfx950() -> bool:
+    """Check if current GPU is gfx950 (CDNA4 / MI350X / MI355X)."""
+    try:
+        target = triton.runtime.driver.active.get_current_target()
+        return target is not None and target.backend == "hip" and target.arch == "gfx950"
+    except (AttributeError, TypeError):
+        return False
+
+
+GROUP_GEMM_BLOCK_SIZE_M = 256 if _is_gfx950() else 128
 
 
 @triton.jit
